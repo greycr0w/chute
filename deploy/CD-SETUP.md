@@ -102,3 +102,5 @@ merge), the `production` Environment approval gate above, and pinned dependencie
 If you'd rather not give GitHub any standing path to the box, switch
 `deploy.yml`'s trigger to tags only, or set `CD_ENABLED=false` and deploy
 manually with `./deploy/deploy.sh` from your Mac.
+
+# CD pipeline verified live 2026-05-31
