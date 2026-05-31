@@ -120,6 +120,11 @@ class Mux:
         await self._send(protocol.OPEN, sid, b"")
         return stream
 
+    async def aclose(self, code: int = 1000, reason: str = "") -> None:
+        """Close the underlying WebSocket. The Mux owns its connection, so
+        callers tear it down through here instead of touching the socket."""
+        await self._ws.close(code=code, reason=reason)
+
     async def _send(self, ftype: int, sid: int, payload: bytes) -> None:
         await self._ws.send(protocol.encode(ftype, sid, payload))
 

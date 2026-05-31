@@ -108,16 +108,23 @@ class _LabelError(Exception):
     """A subdomain request we can't honor; the message is the wire `reason`."""
 
 
+# Strong refs to fire-and-forget close tasks: the event loop keeps only a weak
+# reference, so an untracked task could be garbage-collected before it runs.
+_pending_closes: set[asyncio.Task] = set()
+
+
 def _schedule_ws_close(mux: Mux, code: int, reason: str) -> None:
     """Tear down a superseded connection without blocking on a hung peer."""
 
     async def _close() -> None:
         try:
-            await mux._ws.close(code=code, reason=reason)
+            await mux.aclose(code=code, reason=reason)
         except Exception:
             pass
 
-    asyncio.ensure_future(_close())
+    task = asyncio.ensure_future(_close())
+    _pending_closes.add(task)
+    task.add_done_callback(_pending_closes.discard)
 
 
 class Server:
