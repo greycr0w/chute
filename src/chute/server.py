@@ -367,8 +367,8 @@ class Server:
             if not names.valid_label(label):
                 raise _LabelError("invalid_subdomain")
             return label
-        for _ in range(100):  # auto-assign: pick a free random label
-            label = names.random_label()
+        for _ in range(100):  # auto-assign: pick a free, friendly random label
+            label = names.random_phrase()
             if label not in self._agents:
                 return label
         raise _LabelError("no_free_subdomain")  # astronomically unlikely
