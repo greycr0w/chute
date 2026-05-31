@@ -1,0 +1,30 @@
+# --- secrets / local certs: NEVER commit ---
+*.pem
+*.key
+chute-cert.pem
+chute-key.pem
+.env
+*.env
+
+# --- python build / caches ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- logs / os / editors ---
+*.log
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local-only: detailed audit / attack map, not for the public repo
+SECURITY-REVIEW.md

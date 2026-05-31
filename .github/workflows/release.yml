@@ -1,0 +1,25 @@
+name: Release
+
+# Tag a version (e.g. `git tag v0.2.0 && git push --tags`) and this builds the
+# wheel + sdist and attaches them to a GitHub Release. No PyPI (no third party):
+# you `pipx install` the wheel straight from the Release, or pip install it.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # needed to create the Release
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Build wheel + sdist
+        run: uv build
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

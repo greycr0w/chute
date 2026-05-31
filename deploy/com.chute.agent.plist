@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Fire-and-forget agent on your Mac. launchd keeps it alive across reboots,
+  sleep/wake and crashes; the agent's own backoff loop handles network blips.
+
+  Edit the paths/host/token below, then:
+    cp deploy/com.chute.agent.plist ~/Library/LaunchAgents/
+    launchctl load -w ~/Library/LaunchAgents/com.chute.agent.plist
+  Stop with:
+    launchctl unload -w ~/Library/LaunchAgents/com.chute.agent.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.chute.agent</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/CHANGE_ME/Development/chute/.venv/bin/chute</string>
+    <string>8000</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CHUTE_SERVER</key>
+    <string>tunnel.example.com</string>
+    <key>CHUTE_TOKEN</key>
+    <string>CHANGE_ME</string>
+    <key>CHUTE_SERVER_CERT</key>
+    <string>/Users/CHANGE_ME/Development/chute/chute-cert.pem</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>StandardOutPath</key>
+  <string>/tmp/chute.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/chute.err</string>
+</dict>
+</plist>

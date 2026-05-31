@@ -1,0 +1,50 @@
+name: Deploy
+
+# Auto-deploy to the VPS on every push to main. Ships DORMANT: the job is skipped
+# until you set repo variable CD_ENABLED=true and add the secrets below
+# (full secure bootstrap in deploy/CD-SETUP.md). The SSH key is restricted
+# server-side to a single forced command, so this pipeline can only *trigger a
+# deploy* on the box -- it can never obtain an interactive shell.
+
+on:
+  push:
+    branches: [main]
+
+# This job needs no repo write access and (deliberately) checks out nothing.
+permissions:
+  contents: read
+
+# Never let two deploys overlap; never cancel one mid-flight.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # Master switch. Until you set the CD_ENABLED repo variable to "true", every
+    # push skips this job -- so merging code never silently touches production.
+    if: vars.CD_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    # Point this at a GitHub "production" Environment. Add required reviewers to
+    # that environment for a human approval gate on every deploy (recommended for
+    # a box this important). No third-party Actions run here on purpose.
+    environment: production
+    steps:
+      - name: Trigger hardened deploy on the VPS
+        env:
+          # Secrets are read into env (never inlined into the shell) to avoid
+          # script-injection via expression interpolation.
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SSH_USER: ${{ secrets.DEPLOY_SSH_USER }}
+          SSH_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY"     > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          # Host key is pinned (StrictHostKeyChecking=yes + our known_hosts), and
+          # the key is forced-command locked server-side; the "deploy" arg is
+          # advisory. A non-zero exit (failed restart / nginx -t) fails the run.
+          ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            "$SSH_USER@$SSH_HOST" deploy

@@ -1,0 +1,61 @@
+# /etc/systemd/system/chuted.service
+# Fire-and-forget multi-tenant tunnel server. Auto-starts on boot, auto-restarts
+# on crash. Installed + enabled by deploy/deploy.sh -- you shouldn't need to
+# touch this by hand.
+#
+# Config + the shared token live in /etc/chute/chute.env (chmod 600), written
+# once by the deploy script. nginx owns :80/:443 and proxies to chute on
+# 127.0.0.1:8080, so this process needs no privileged ports and no root.
+[Unit]
+Description=chute tunnel server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=chute
+Group=chute
+WorkingDirectory=/opt/chute
+EnvironmentFile=/etc/chute/chute.env
+ExecStart=/opt/chute/.venv/bin/chuted run
+Restart=always
+RestartSec=2
+
+# --- resource backstops (contain a DoS to this unit, not the whole VPS) ---
+MemoryMax=512M
+TasksMax=256
+LimitNOFILE=8192
+
+# --- filesystem: code + keys stay READ-ONLY at runtime ---
+# The process only reads under /opt/chute (venv, pinned cert) and logs to
+# journald; it never writes there. So we do NOT grant ReadWritePaths=/opt/chute
+# -- ProtectSystem=strict then prevents a compromised process from rewriting its
+# own interpreter/package code (persistence) or exfiltrating via a writable path.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectProc=invisible
+ProcSubset=pid
+UMask=0077
+
+# --- privilege / kernel surface (binds only high unprivileged ports) ---
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
