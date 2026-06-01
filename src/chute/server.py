@@ -38,6 +38,7 @@ import logging
 import ssl
 import time
 from pathlib import Path
+from typing import Any
 
 import websockets
 
@@ -117,7 +118,7 @@ class _LabelError(Exception):
 
 # Strong refs to fire-and-forget close tasks: the event loop keeps only a weak
 # reference, so an untracked task could be garbage-collected before it runs.
-_pending_closes: set[asyncio.Task] = set()
+_pending_closes: set[asyncio.Task[None]] = set()
 
 
 def _schedule_ws_close(mux: Mux, code: int, reason: str) -> None:
@@ -291,7 +292,7 @@ class Server:
                 log.warning("public TLS cert reload failed: %s", exc)
 
     # -- control channel -------------------------------------------------------
-    async def _handle_agent(self, ws) -> None:
+    async def _handle_agent(self, ws: Any) -> None:
         # Bound concurrent PRE-AUTH handshakes: the control port is internet-
         # facing and unauthenticated until the token check below, so an uncapped
         # flood of half-open handshakes could exhaust FDs/CPU. Authenticated,
@@ -358,7 +359,7 @@ class Server:
         else:
             await self._serve_agent_single(ws, scheme)
 
-    async def _serve_agent_single(self, ws, scheme: str) -> None:
+    async def _serve_agent_single(self, ws: Any, scheme: str) -> None:
         if scheme == "https" and self._public_tls_context is not None and self.public_https_url:
             public_url = self.public_https_url
         else:
@@ -379,7 +380,9 @@ class Server:
                 self._agent = None
             log.info("agent disconnected")
 
-    async def _serve_agent_multi(self, ws, hello: dict, scheme: str, auth: AuthResult) -> None:
+    async def _serve_agent_multi(
+        self, ws: Any, hello: dict[str, Any], scheme: str, auth: AuthResult
+    ) -> None:
         account_id = auth.account_id
         try:
             label = self._assign_label(hello.get("subdomain"))
