@@ -104,3 +104,5 @@ If you'd rather not give GitHub any standing path to the box, switch
 manually with `./deploy/deploy.sh` from your Mac.
 
 # CD pipeline verified live 2026-05-31
+
+# branch-protection live-test 1780272243
