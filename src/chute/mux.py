@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from . import protocol
 
@@ -95,7 +96,7 @@ class Mux:
 
     def __init__(
         self,
-        ws,
+        ws: Any,  # a websockets connection (send/recv/close, async-iterable)
         on_open: Callable[[Stream], Awaitable[None]] | None = None,
         max_streams: int = _MAX_STREAMS,
     ) -> None:
@@ -103,7 +104,7 @@ class Mux:
         self._on_open = on_open
         self._streams: dict[int, Stream] = {}
         self._next_id = 1
-        self._tasks: set[asyncio.Task] = set()
+        self._tasks: set[asyncio.Task[None]] = set()
         self._max_streams = max_streams
 
     async def open(self) -> Stream:
@@ -140,8 +141,8 @@ class Mux:
         """Pump frames off the websocket until it closes, then abort streams."""
         try:
             async for message in self._ws:
-                if not isinstance(message, (bytes, bytearray)):
-                    continue  # ignore stray text frames after the handshake
+                if not isinstance(message, bytes):
+                    continue  # binary frames are bytes; ignore stray text (str) frames
                 try:
                     ftype, sid, payload = protocol.decode(message)
                 except ValueError:

@@ -19,14 +19,24 @@ import os
 import secrets
 import sys
 from pathlib import Path
+from typing import overload
 
 from . import certs
 from .auth import Authorizer
 from .client import Tunnel
 from .server import Server
 
+log = logging.getLogger("chute")
 
+
+@overload
+def _env(name: str, default: str) -> str: ...
+@overload
+def _env(name: str, default: None = None) -> str | None: ...
 def _env(name: str, default: str | None = None) -> str | None:
+    # Overloaded so callers that pass a string default get a non-optional str
+    # back (used directly in int(...) / as required values), while callers with
+    # no default get str | None and must handle the missing case.
     return os.environ.get(name, default)
 
 
@@ -210,7 +220,7 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
 def _run_server(args: argparse.Namespace) -> int:
     _setup_logging(getattr(args, "verbose", False))
     if not args.token:
-        print("error: --token is required (or set CHUTE_TOKEN)")
+        log.error("--token is required (or set CHUTE_TOKEN)")
         return 2
 
     # Multi-tenant routing peeks the Host header; if exposed directly to
@@ -230,8 +240,12 @@ def _run_server(args: argparse.Namespace) -> int:
     if cert.exists() and key.exists():
         ssl_ctx = certs.server_ssl_context(cert, key)
     else:
-        print(f"warning: {cert}/{key} not found -- control channel will be PLAINTEXT.")
-        print("         run `chuted gen-cert --host <ip>` first.")
+        log.warning(
+            "%s/%s not found -- control channel will be PLAINTEXT; "
+            "run `chuted gen-cert --host <ip>` first",
+            cert,
+            key,
+        )
 
     tls_cert = tls_key = None
     public_https_url = None
@@ -243,7 +257,7 @@ def _run_server(args: argparse.Namespace) -> int:
             suffix = "" if args.tls_port == 443 else f":{args.tls_port}"
             public_https_url = f"https://{host}{suffix}/"
         else:
-            print(f"warning: TLS cert/key not found ({tc} / {tk}) -- https disabled.")
+            log.warning("TLS cert/key not found (%s / %s) -- https disabled", tc, tk)
 
     server = Server(
         token=args.token,
