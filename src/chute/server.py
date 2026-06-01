@@ -36,12 +36,13 @@ import html
 import json
 import logging
 import ssl
+import time
 from pathlib import Path
 
 import websockets
 
 from . import certs, names
-from .auth import Authorizer, StaticTokenAuthorizer
+from .auth import Authorizer, AuthResult, StaticTokenAuthorizer
 from .mux import Mux, Stream
 
 log = logging.getLogger("chute.server")
@@ -60,6 +61,12 @@ _DEFAULT_MAX_VISITORS = 2048  # concurrent public connections
 _DEFAULT_HELLO_TIMEOUT = 5.0  # seconds an unauthenticated peer may squat
 _VISITOR_ACQUIRE_TIMEOUT = 5.0  # wait for a visitor slot before 503
 _DRAIN_TIMEOUT = 120.0  # no-progress write timeout on the relay
+
+# Per-IP failed-auth limiter: an IP gets _AUTH_FAIL_MAX bad handshakes per
+# _AUTH_FAIL_WINDOW seconds before further connects are turned away (close 1013).
+# Only failures count, so a legitimate agent on a clean IP is never throttled.
+_AUTH_FAIL_MAX = 5
+_AUTH_FAIL_WINDOW = 60.0
 
 
 def _http_response(status: str, body: bytes) -> bytes:
@@ -168,7 +175,13 @@ class Server:
         self.base_domain = base_domain.lower().strip(".") if base_domain else None
         self.upstream_tls = upstream_tls
         self._agent: Mux | None = None  # single-tenant: the one agent
-        self._agents: dict[str, Mux] = {}  # multi-tenant: label -> agent
+        # Multi-tenant routing: label -> (agent mux, owning account id), plus the
+        # reverse index account id -> its live labels (for the concurrency cap and
+        # same-account reclaim). Visitor routing only ever reads the mux.
+        self._agents: dict[str, tuple[Mux, str]] = {}
+        self._account_labels: dict[str, set[str]] = {}
+        # Per-IP failed-auth timestamps (monotonic), pruned opportunistically.
+        self._auth_fails: dict[str, list[float]] = {}
 
         # Pre-auth / concurrency backstops (framing & rate only; never payload).
         self.hello_timeout = hello_timeout
@@ -308,14 +321,32 @@ class Server:
             # turn the concurrency cap into a DoS amplifier.
             self._control_sem.release()
 
-        # Exactly one authorization call per connect, OUTSIDE the pre-auth
-        # semaphore. The default StaticTokenAuthorizer preserves single-tenant
-        # behavior; an alternative authorizer can do an account/token lookup.
+        # Per-IP failed-auth limiter: an IP that has burned its budget of bad
+        # handshakes is turned away before we spend an authorize call on it. Only
+        # failures consume budget, so a good token from a clean IP never waits.
         agent_ip = ws.remote_address[0] if ws.remote_address else None
-        auth = await self.authorizer.authenticate(
-            str(hello.get("token", "")), hello.get("subdomain"), agent_ip
-        )
+        if not self._auth_rate_ok(agent_ip):
+            with contextlib.suppress(Exception):
+                await ws.close(code=1013, reason="too many auth failures")
+            log.warning("rate-limited agent handshakes from %s", ws.remote_address)
+            return
+
+        # Exactly one authorization call per connect, OUTSIDE the pre-auth
+        # semaphore. A *raised* exception means the authorizer is unavailable (e.g.
+        # a database blip) -- RETRYABLE, so we close 1013 with no error frame and
+        # the agent backs off and reconnects. A *None* return is a genuine rejection
+        # (bad/revoked token) -- fatal, closed 4001 with an error frame.
+        try:
+            auth = await self.authorizer.authenticate(
+                str(hello.get("token", "")), hello.get("subdomain"), agent_ip
+            )
+        except Exception:
+            log.warning("authorizer unavailable for agent from %s", ws.remote_address)
+            with contextlib.suppress(Exception):
+                await ws.close(code=1013, reason="try again later")
+            return
         if auth is None:
+            self._record_auth_fail(agent_ip)
             await ws.send(json.dumps({"type": "error", "reason": "unauthorized"}))
             await ws.close(code=4001, reason="unauthorized")
             log.warning("rejected agent (unauthorized) from %s", ws.remote_address)
@@ -323,7 +354,7 @@ class Server:
 
         scheme = str(hello.get("scheme", "http"))
         if self.base_domain:
-            await self._serve_agent_multi(ws, hello, scheme)
+            await self._serve_agent_multi(ws, hello, scheme, auth)
         else:
             await self._serve_agent_single(ws, scheme)
 
@@ -348,9 +379,11 @@ class Server:
                 self._agent = None
             log.info("agent disconnected")
 
-    async def _serve_agent_multi(self, ws, hello: dict, scheme: str) -> None:
+    async def _serve_agent_multi(self, ws, hello: dict, scheme: str, auth: AuthResult) -> None:
+        account_id = auth.account_id
         try:
             label = self._assign_label(hello.get("subdomain"))
+            self._authorize_claim(account_id, label, auth.max_tunnels)
         except _LabelError as exc:
             await ws.send(json.dumps({"type": "error", "reason": str(exc)}))
             await ws.close(code=4002, reason=str(exc))
@@ -359,24 +392,31 @@ class Server:
 
         public_url = self._public_url_for(label, scheme)
         mux = Mux(ws)
-        # Newest wins per label. With a single shared token there's no foreign
-        # party to hijack, and this keeps reconnection (laptop sleep, Wi-Fi flap)
-        # seamless: a re-dialing agent reclaims its own label instead of being
-        # permanently locked out by its own stale connection.
+        # Newest wins for a label, but only the SAME account may reclaim it
+        # (_authorize_claim already rejected a different account). This keeps
+        # reconnection (laptop sleep, Wi-Fi flap) seamless: a re-dialing agent
+        # reclaims its own label instead of being locked out by its stale conn.
         previous = self._agents.get(label)
-        self._agents[label] = mux
+        self._agents[label] = (mux, account_id)
+        self._account_labels.setdefault(account_id, set()).add(label)
         if previous is not None:
             log.warning("agent reclaimed busy label %r (newest wins)", label)
-            _schedule_ws_close(previous, 4003, "superseded")
+            _schedule_ws_close(previous[0], 4003, "superseded")
         await ws.send(json.dumps({"type": "ready", "public_url": public_url, "subdomain": label}))
         log.info("agent %r connected from %s -> %s", label, ws.remote_address, public_url)
         try:
             await mux.run()
         finally:
-            # Only clear if we're still the registered agent (a newer agent that
-            # replaced us must keep its slot).
-            if self._agents.get(label) is mux:
+            # Only clear if we're still the registered agent (a newer same-account
+            # agent that replaced us must keep its slot and its account-label entry).
+            current = self._agents.get(label)
+            if current is not None and current[0] is mux:
                 del self._agents[label]
+                labels = self._account_labels.get(account_id)
+                if labels is not None:
+                    labels.discard(label)
+                    if not labels:
+                        del self._account_labels[account_id]
             log.info("agent %r disconnected", label)
 
     def _assign_label(self, requested: object) -> str:
@@ -398,6 +438,50 @@ class Server:
         if scheme == "https":
             log.warning("agent %r requested https but https is unavailable; serving http", label)
         return f"http://{label}.{self.base_domain}/"
+
+    def _authorize_claim(self, account_id: str, label: str, max_tunnels: int) -> None:
+        """Decide whether *account_id* may claim *label*; raise _LabelError with a
+        client-facing reason otherwise. Synchronous and await-free, so check-and-claim
+        is atomic on the single-threaded event loop -- no lock needed."""
+        held = self._agents.get(label)
+        if held is not None and held[1] != account_id:
+            raise _LabelError("subdomain_taken")  # a different account holds it now
+        owned = self._account_labels.get(account_id, ())
+        # Reclaiming a label this account already holds is a replacement, not a new
+        # tunnel, so it never counts against the cap (keeps reconnect seamless).
+        if label not in owned and len(owned) >= max_tunnels:
+            raise _LabelError("tunnel_limit")
+
+    def _auth_rate_ok(self, ip: str | None) -> bool:
+        """True if *ip* is under its failed-auth budget; prunes this IP's expired
+        failures as a side effect."""
+        if ip is None:
+            return True  # no usable peer address to key a bucket on; don't block
+        fails = self._auth_fails.get(ip)
+        if not fails:
+            return True
+        now = time.monotonic()
+        fresh = [t for t in fails if now - t < _AUTH_FAIL_WINDOW]
+        if fresh:
+            self._auth_fails[ip] = fresh
+        else:
+            del self._auth_fails[ip]
+        return len(fresh) < _AUTH_FAIL_MAX
+
+    def _record_auth_fail(self, ip: str | None) -> None:
+        """Note a failed auth from *ip*, sweeping stale buckets to stay bounded."""
+        if ip is None:
+            return
+        now = time.monotonic()
+        self._auth_fails.setdefault(ip, []).append(now)
+        if len(self._auth_fails) > 4096:  # opportunistic global sweep
+            stale = [
+                k
+                for k, v in self._auth_fails.items()
+                if all(now - t >= _AUTH_FAIL_WINDOW for t in v)
+            ]
+            for k in stale:
+                del self._auth_fails[k]
 
     # -- public side -----------------------------------------------------------
     async def _handle_visitor(
@@ -467,7 +551,8 @@ class Server:
 
         host = _host_from_head(head)
         label = self._label_from_host(host)
-        agent = self._agents.get(label) if label else None
+        entry = self._agents.get(label) if label else None
+        agent = entry[0] if entry is not None else None
         if agent is None:
             writer.write(_no_tunnel_response(host or "?"))
             await _safe_drain(writer)

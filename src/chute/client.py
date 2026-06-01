@@ -53,6 +53,12 @@ log = logging.getLogger("chute.client")
 _MAX_WS_MESSAGE = 256 * 1024
 _DRAIN_TIMEOUT = 120.0
 
+# Control-channel close codes the agent must NOT retry: a rejected token (4001) or
+# a rejected subdomain / over-limit (4002) won't be fixed by reconnecting. Every
+# other close (e.g. 1013 "try again later" when the authorizer is briefly down, or
+# a plain network drop) is transient -> the supervisory loop backs off and retries.
+_FATAL_CLOSE_CODES = frozenset({4001, 4002})
+
 
 class Tunnel:
     def __init__(
@@ -147,7 +153,18 @@ class Tunnel:
             if self._requested_subdomain:
                 auth["subdomain"] = self._requested_subdomain
             await ws.send(json.dumps(auth))
-            reply = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+            try:
+                reply = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+            except websockets.ConnectionClosed as exc:
+                # Server closed during the handshake without a reply frame. Decide
+                # fatal-vs-retry by close code, not by frame presence, so a
+                # retryable 1013 (authorizer briefly unavailable) backs off instead
+                # of giving up, while a fatal 4001/4002 doesn't loop forever.
+                close = exc.rcvd or exc.sent
+                code = close.code if close is not None else None
+                if code in _FATAL_CLOSE_CODES:
+                    raise _FatalError((close.reason if close else "") or f"closed {code}") from exc
+                raise
             if reply.get("type") != "ready":
                 # auth/subdomain rejections can't be fixed by retrying
                 raise _FatalError(reply.get("reason", "handshake rejected"))
