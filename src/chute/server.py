@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hmac
 import html
 import json
 import logging
@@ -42,6 +41,7 @@ from pathlib import Path
 import websockets
 
 from . import certs, names
+from .auth import Authorizer, StaticTokenAuthorizer
 from .mux import Mux, Stream
 
 log = logging.getLogger("chute.server")
@@ -148,8 +148,13 @@ class Server:
         max_control_conns: int = _DEFAULT_MAX_CONTROL_CONNS,
         max_visitors: int = _DEFAULT_MAX_VISITORS,
         hello_timeout: float = _DEFAULT_HELLO_TIMEOUT,
+        authorizer: Authorizer | None = None,
     ) -> None:
         self.token = token
+        # The authorization seam. Default preserves the original single-shared-token
+        # behavior; an alternative authorizer (e.g. database-backed) can be injected
+        # via the CHUTE_AUTHORIZER knob (see cli.py).
+        self.authorizer: Authorizer = authorizer or StaticTokenAuthorizer(token)
         self.public_host = public_host
         self.public_port = public_port
         self.control_host = control_host
@@ -295,15 +300,28 @@ class Server:
                 # close path instead of raising an AttributeError traceback.
                 await ws.close(code=4000, reason="bad handshake")
                 return
-            if not hmac.compare_digest(str(hello.get("token", "")), self.token):
-                await ws.send(json.dumps({"type": "error", "reason": "unauthorized"}))
-                await ws.close(code=4001, reason="unauthorized")
-                log.warning("rejected agent (bad token) from %s", ws.remote_address)
-                return
-            scheme = str(hello.get("scheme", "http"))
         finally:
+            # Release the pre-auth handshake slot BEFORE authorizing. The semaphore
+            # bounds half-open handshakes -- which are over once we have the hello --
+            # not the authorize call, which may do slow I/O (e.g. a database lookup)
+            # in an alternative authorizer. Holding it across a slow authorize would
+            # turn the concurrency cap into a DoS amplifier.
             self._control_sem.release()
 
+        # Exactly one authorization call per connect, OUTSIDE the pre-auth
+        # semaphore. The default StaticTokenAuthorizer preserves single-tenant
+        # behavior; an alternative authorizer can do an account/token lookup.
+        agent_ip = ws.remote_address[0] if ws.remote_address else None
+        auth = await self.authorizer.authenticate(
+            str(hello.get("token", "")), hello.get("subdomain"), agent_ip
+        )
+        if auth is None:
+            await ws.send(json.dumps({"type": "error", "reason": "unauthorized"}))
+            await ws.close(code=4001, reason="unauthorized")
+            log.warning("rejected agent (unauthorized) from %s", ws.remote_address)
+            return
+
+        scheme = str(hello.get("scheme", "http"))
         if self.base_domain:
             await self._serve_agent_multi(ws, hello, scheme)
         else:

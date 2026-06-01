@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib
 import logging
 import os
 import secrets
@@ -20,12 +21,41 @@ import sys
 from pathlib import Path
 
 from . import certs
+from .auth import Authorizer
 from .client import Tunnel
 from .server import Server
 
 
 def _env(name: str, default: str | None = None) -> str | None:
     return os.environ.get(name, default)
+
+
+def _build_authorizer(token: str) -> Authorizer | None:
+    """Resolve the ``CHUTE_AUTHORIZER`` import-string to an Authorizer, or return
+    None so the Server falls back to the single-token default.
+
+    Format is Gunicorn-style ``package.module:attr``. If ``attr`` is callable (a
+    class or a factory) it is called with no arguments -- a database-backed
+    authorizer reads its own config from the environment; an already-built instance
+    is used as-is. This is the only hook for injecting an alternative authorizer.
+    """
+    spec = (os.environ.get("CHUTE_AUTHORIZER") or "").strip()
+    if not spec:
+        return None
+    module_path, sep, attr = spec.partition(":")
+    if not sep or not module_path or not attr:
+        raise SystemExit(f"CHUTE_AUTHORIZER must be 'module:attr', got {spec!r}")
+    try:
+        target = getattr(importlib.import_module(module_path), attr)
+    except (ImportError, AttributeError) as exc:
+        raise SystemExit(f"CHUTE_AUTHORIZER {spec!r} could not be imported: {exc}") from exc
+    authorizer = target() if callable(target) else target
+    if not isinstance(authorizer, Authorizer):
+        raise SystemExit(
+            f"CHUTE_AUTHORIZER {spec!r} did not resolve to an Authorizer "
+            "(needs an async authenticate method)"
+        )
+    return authorizer
 
 
 def _env_bool(name: str) -> bool:
@@ -229,6 +259,7 @@ def _run_server(args: argparse.Namespace) -> int:
         public_https_url=public_https_url,
         base_domain=args.base_domain,
         upstream_tls=args.upstream_tls,
+        authorizer=_build_authorizer(args.token),
     )
     try:
         asyncio.run(server.serve())
