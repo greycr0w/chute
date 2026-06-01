@@ -18,6 +18,10 @@ dist/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
 
 # --- logs / os / editors ---
 *.log

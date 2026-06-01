@@ -27,6 +27,21 @@ jobs:
       - name: Ruff format check
         run: uvx ruff@0.15.15 format --check .
 
+  types:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      # --locked makes the committed uv.lock load-bearing: it errors if the lock
+      # has drifted from pyproject.toml, so a stale lock fails CI instead of being
+      # silently re-resolved.
+      - name: Install (locked)
+        run: uv sync --locked --extra dev
+      - name: mypy --strict
+        run: uv run --no-sync mypy
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -38,9 +53,9 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - name: Create venv (${{ matrix.python-version }})
-        run: uv venv --python ${{ matrix.python-version }}
-      - name: Install
-        run: uv pip install -e ".[dev]"
+      # The universal uv.lock resolves across the whole matrix; --locked pins the
+      # exact dependency set on every Python version for reproducible runs.
+      - name: Install (locked)
+        run: uv sync --locked --extra dev --python ${{ matrix.python-version }}
       - name: Test
-        run: uv run pytest -q
+        run: uv run --no-sync pytest -q --cov=chute --cov-report=term-missing
