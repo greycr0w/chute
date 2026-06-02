@@ -15,15 +15,45 @@ one that maps tokens to accounts -- can be injected at runtime via the
 from __future__ import annotations
 
 import hmac
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
-__all__ = ["UNLIMITED_TUNNELS", "AuthResult", "Authorizer", "StaticTokenAuthorizer"]
+__all__ = ["UNLIMITED_TUNNELS", "AuthResult", "Authorizer", "Budget", "StaticTokenAuthorizer"]
 
 # The single-tenant default: no per-account tunnel cap. Large but finite so callers
 # can compare/relational-test it without special-casing math.inf. An alternative
 # authorizer can return a real per-account limit (e.g. 3) instead.
 UNLIMITED_TUNNELS = 1 << 62
+
+
+@dataclass(frozen=True, slots=True)
+class Budget:
+    """Per-account resource budget an :class:`Authorizer` may attach to an
+    :class:`AuthResult`. ``None`` on a field means *unlimited*; the all-``None``
+    default preserves single-tenant behaviour.
+
+    chute can only enforce **transport-level** budgets. It is a byte-transparent pipe,
+    not a WAF -- application facts (failed-request rates, per-route abuse) are invisible
+    to it and belong to the app behind the tunnel, so they are deliberately NOT here.
+
+    ENFORCED today (the relay checks these):
+
+    - ``max_visitors`` -- max concurrent visitor streams summed across all of the
+      account's live tunnels. Admission past it is refused (503).
+
+    RESERVED -- an authorizer MAY set these and a future relay will honour them, but
+    they are **not enforced yet**; do not rely on them as a control:
+
+    - ``max_bytes_per_sec``      -- aggregate relayed bandwidth per account.
+    - ``max_reconnects_per_min`` -- control-channel reconnect rate per account.
+    - ``max_buffered_bytes``     -- aggregate in-flight memory per account (today
+      bounded only indirectly by ``max_tunnels`` × the per-connection memory cap).
+    """
+
+    max_visitors: int | None = None  # ENFORCED
+    max_bytes_per_sec: int | None = None  # reserved (not yet enforced)
+    max_reconnects_per_min: int | None = None  # reserved (not yet enforced)
+    max_buffered_bytes: int | None = None  # reserved (not yet enforced)
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,11 +67,14 @@ class AuthResult:
       authorizer that enforces limits sets it (the relay can compare against it).
     - ``allowed_label`` -- a label this account may always claim (a reserved name),
       or ``None`` for no special grant.
+    - ``budget`` -- per-account resource :class:`Budget` (default: unlimited). The
+      relay enforces the transport-level fields it can; see :class:`Budget`.
     """
 
     account_id: str
     max_tunnels: int = UNLIMITED_TUNNELS
     allowed_label: str | None = None
+    budget: Budget = field(default_factory=Budget)
 
 
 @runtime_checkable
@@ -73,6 +106,10 @@ class StaticTokenAuthorizer:
         # Constant-time compare, identical to the inline check the server used
         # before. requested_subdomain/agent_ip are irrelevant to a single shared
         # token; the relay still does its own label assignment downstream.
-        if hmac.compare_digest(str(token), self._token):
+        # Compare as bytes: hmac.compare_digest raises TypeError on a non-ASCII
+        # str, and the server's blanket except would mistake that crash for
+        # "authorizer unavailable" (retryable 1013) -- bypassing the failed-auth
+        # limiter on any Unicode token. encode() makes a bad token a clean reject.
+        if hmac.compare_digest(str(token).encode(), self._token.encode()):
             return AuthResult(account_id="0")
         return None

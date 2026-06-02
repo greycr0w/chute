@@ -16,24 +16,40 @@ visitor ──▶ chute server (VPS, public)
 - **Agent dials out** over a single connection → traverses NAT/firewalls, no
   inbound ports on your Mac.
 - **Stream multiplexing** over that one connection (like HTTP/2 / yamux) →
-  no connection-pool exhaustion, clean concurrency.
+  no connection-pool exhaustion, clean concurrency, with **per-stream
+  credit-window flow control** so a slow consumer can't make the other end
+  buffer without bound. Full spec: [docs/PROTOCOL.md](docs/PROTOCOL.md).
 - **Pinned self-signed cert** for the control channel → strong MITM protection,
   **no certbot, no ACME, no renewals** (10-year cert = fire-and-forget).
 - **Token auth** (constant-time compare) gates the control channel.
-- **Raw L4 relay** on the public side → transparently carries keep-alive,
-  chunked, SSE and WebSocket upgrades; the public side stays plain HTTP so
-  there is no mixed-content surprise for embedded iframes / Selenium.
+- **One HTTP tunnel foundation** on the public side → every visitor must send a
+  complete HTTP request head before chute opens an agent stream; after that,
+  the request head and body, response headers, chunked bodies, SSE and WebSocket
+  upgrades pass through verbatim.
 - **Auto-reconnect** with backoff + jitter → survives sleep/wake, Wi-Fi
   changes and server restarts.
 
+## Protocol
+
+The control connection is a binary **stream multiplexer** with credit-window flow
+control — the same family as HTTP/2 / yamux — specified in full at
+**[docs/PROTOCOL.md](docs/PROTOCOL.md)**: the JSON handshake, frame format, the stream
+state machine, flow control, teardown, the limits each end enforces against a
+misbehaving peer, and the close codes.
+
+The protocol is **versioned and negotiated in the handshake**; the current version is
+**3** (credit-window flow control + `GOAWAY` graceful drain). Server and agent must be
+upgraded **together** — a version mismatch fails fast with a clear "upgrade" close
+rather than silently stalling, and v3 is not interoperable with older builds.
+
 ## Staying HTTP (the whole point)
 
-chute is a **transparent byte pipe**. It never adds TLS, never redirects to
-HTTPS, never sends HSTS — and, just as deliberately, never *strips or rewrites*
-what your app sends. Headers, keep-alive, chunked bodies, SSE and WebSocket
-upgrades all pass through verbatim. If your app serves it, the browser sees it.
-(There is intentionally no response sanitiser; a tunnel that mangles headers
-isn't a tunnel.)
+chute is an **HTTP tunnel**. A visitor must send a complete HTTP request head
+before chute opens a stream to the agent; that makes admission explicit and
+prevents partial requests from pinning agent streams. Once admitted, chute
+forwards the request head verbatim and never redirects to HTTPS, never sends
+HSTS, and never strips or rewrites what your app sends. Headers, keep-alive,
+chunked bodies, SSE and WebSocket upgrades pass through as the app emits them.
 
 That transparency is exactly what makes the embedded-iframe + `postMessage`
 flow work:
@@ -59,9 +75,9 @@ The HTTP transparency above is one *workflow*; chute also serves **HTTPS per
 tunnel** for normal web apps. You pick the scheme when you start the agent:
 
 ```bash
-chute http  8000     # transparent plain-HTTP pipe (default; the iframe case)
-chute https 3000     # public endpoint is HTTPS
-chute 8000           # bare form == http (backward compatible)
+chute https 3000     # public endpoint is HTTPS (the default)
+chute http  8000     # plaintext pipe — bare IP, no public cert, or the iframe case
+chute 8000           # bare form == https
 ```
 
 How it works: **TLS terminates at the server edge** (a `:443` listener on the
@@ -90,9 +106,9 @@ chuted run --token "$CHUTE_TOKEN" --domain app.example.com \
 ```
 
 The `--tls-cert/--tls-key` files are watched; when the ACME timer renews them,
-chute swaps the cert for new connections on its own. If `--tls-cert` is absent,
-the server is HTTP-only exactly as before, and an agent that asks for `https`
-gets a logged warning + an `http://` URL rather than a failure.
+chute swaps the cert for new connections on its own. If HTTPS cannot be
+truthfully advertised, an agent that asks for `https` fails closed with
+`https_unavailable`; pass `http` explicitly when you want plaintext.
 
 ## Install
 
@@ -140,7 +156,7 @@ CHUTE_TOKEN=<secret> chuted run --public-port 80 --public-url http://tunnel.exam
 export CHUTE_SERVER=tunnel.example.com
 export CHUTE_TOKEN=<secret>
 export CHUTE_SERVER_CERT=./chute-cert.pem
-chute 8000
+chute http 8000      # `http` since this server has no public TLS (https is the default)
 #   chute  http://tunnel.example.com/  ->  127.0.0.1:8000
 ```
 
@@ -155,17 +171,18 @@ with Tunnel(server="tunnel.example.com", token="...", local_port=8000,
     t.wait()           # block until Ctrl-C; reconnects automatically
 ```
 
-For an HTTPS tunnel, add `scheme="https"` (the server must have a public cert
-configured); everything else is identical:
+The SDK default asks for HTTPS. If the server cannot truthfully advertise HTTPS,
+startup fails with `https_unavailable`. For an explicit plaintext tunnel, pass
+`scheme="http"`:
 
 ```python
 with Tunnel(server="vps.example.com", token="...", local_port=3000,
-            server_cert="chute-cert.pem", scheme="https") as t:
-    print(t.public_url)        # -> https://app.example.com/
+            server_cert="chute-cert.pem", scheme="http") as t:
+    print(t.public_url)        # -> http://app.example.com/
     t.wait()
 ```
 
-### Subdomains (multi-tenant)
+### Host-routed labels
 
 If the server runs with a base domain (`--base-domain chute.sh`), every
 tunnel gets its own `<label>.<base-domain>` URL — so you can run many tunnels at
@@ -174,16 +191,23 @@ once through one server. Request a label, or let the server pick one:
 ```python
 with Tunnel(server="chute.sh", token="...", local_port=8000,
             server_cert="chute-cert.pem", subdomain="myapp") as t:
-    print(t.public_url)        # -> http://myapp.chute.sh/
+    print(t.public_url)        # -> https://myapp.chute.sh/
     print(t.subdomain)         # -> "myapp"  (the label the server assigned)
 ```
 
 Omit `subdomain=` and the server auto-assigns a short random label
-(`http://k7m2pq9w.chute.sh/`). Add `scheme="https"` for
-`https://myapp.chute.sh/`. The label is a single DNS label (a–z, 0–9,
-hyphen); a bad one is rejected immediately, client-side. On the CLI it's
-`--subdomain myapp`. If you re-request a label your own tunnel already holds
-(e.g. after a reconnect), you reclaim it — newest connection wins.
+(`https://k7m2pq9w.chute.sh/`). Pass `scheme="http"` when you deliberately want
+`http://myapp.chute.sh/`. The label is a single DNS label (a–z, 0–9, hyphen); a
+bad one is rejected immediately, client-side. On the CLI it's `--subdomain
+myapp`. If you re-request a label your own tunnel already holds (e.g. after a
+reconnect), you reclaim it — newest connection wins.
+
+> **Host-routed labels are loopback-only.** The router commits a whole connection
+> to one agent on that connection's first request, so the public port refuses to
+> bind a routable address and must sit behind a reverse proxy that gives it one
+> request per connection — the bundled
+> [`deploy/nginx-chute.conf`](deploy/nginx-chute.conf) does. See
+> [Security model](#security-model) for why Host routing needs that edge shape.
 
 Or fully async:
 
@@ -224,10 +248,61 @@ Under the hood it installs:
 On the Mac, `deploy/com.chute.agent.plist` (launchd, `KeepAlive`) keeps an
 agent running across reboots.
 
+## Security model
+
+chute has one tunnel foundation: one authenticated agent registry, one admission
+path, one mux, and one relay. The only difference is how a visitor selects the
+registered tunnel:
+
+|                                  | No `--base-domain`             | With `--base-domain`                        |
+| -------------------------------- | ------------------------------ | ------------------------------------------- |
+| Internal label                   | reserved `default`             | DNS label from `Host`                       |
+| Visitor admission                | strictly validated HTTP request head | strictly validated HTTP request head with Host |
+| Routing decision                 | always `default`               | pick the agent by `Host`, per connection    |
+| Public bind                      | can be exposed directly        | loopback-only; put nginx in front           |
+| nginx upstream `keepalive`       | unnecessary                    | **dangerous** — re-creates the desync       |
+
+The default route has no tenant-selection input: any valid HTTP/1.x request goes
+to the reserved `default` label. HTTP/1.0 may omit `Host`; HTTP/1.1 and Host-routed
+requests may not. You are still publishing your local app; chute is not a WAF.
+
+Host-routed labels must choose *which* agent gets a connection, and the only
+place the target tenant is named is the `Host` header. nginx is the authoritative
+public parser and connection manager; chute's parser is only a reject-only
+backstop before it opens a mux stream. That introduces exactly two failure modes,
+with two different owners:
+
+1. **Parser differential — one *ambiguous* request.** Malformed request lines, two
+   `Host` headers, `Host :` with a space before the colon, an obs-folded line, a
+   bare LF, an absolute-form request line, or a missing/invalid `Host` — anything
+   chute might read one way and a downstream hop another.
+   chute **closes this itself**: it does not guess, it answers `400` and drops the
+   connection (it never rewrites the bytes it forwards, so refusing is its only safe
+   move). This is the strict "back-end rejects what the front-end didn't normalize"
+   half of the standard request-smuggling defense.
+
+2. **Connection-level pipelining desync — many *clean* requests.** HTTP/1.1 reuses one
+   connection for many requests, but chute commits the whole connection to one agent
+   on the **first** request and relays the rest blind (that blind relay is what lets
+   WebSocket/SSE/chunked pass through untouched). So a second, perfectly valid request
+   for a *different* tenant on the same connection still lands in the first tenant's
+   agent. chute **cannot** close this without becoming a full HTTP parser — which
+   would destroy transparency and re-open the smuggling surface. It is closed
+   *operationally*, by guaranteeing **one request per connection** into chute.
+
+Because of #2, the Host-routed public port is **loopback-only** — chute refuses to
+bind a routable address when `--base-domain` is set. It must sit behind a reverse
+proxy that opens one upstream connection per request. The bundled
+[`deploy/nginx-chute.conf`](deploy/nginx-chute.conf) does this by default: it has no
+`upstream {}` keepalive block — **don't add one**, that single line re-creates the
+desync. (Routing `Host` → a dynamic, runtime-assigned agent is the one job chute
+can't hand to nginx, which is why the router lives in chute while the
+one-request-per-connection guarantee lives in the proxy.)
+
 ## Scope / non-goals
 
-Multi-tenant subdomains **are** supported (route by `Host` under a base domain;
-auto or requested labels). One shared token still gates all tunnels — there are
-no per-tunnel tokens, no accounts, no dashboard, no request inspection, no OAuth.
-Single-tenant mode (no base domain → one token = one tunnel, pure-L4 relay) is
-still the default and still the path the transparency guarantees are tested on.
+Host-routed labels **are** supported (route by `Host` under a base domain; auto
+or requested labels). The default no-domain route uses the same registry and
+relay path under the reserved internal `default` label. One shared token still
+gates all tunnels by default — there are no dashboards, no request inspection,
+and no OAuth.

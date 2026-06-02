@@ -30,8 +30,12 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "websockets>=12.0",
-    "cryptography>=42.0",
+    # Bounded to the tested major. Prod installs from source via pip (deploy.sh), not
+    # from uv.lock, so an unbounded floor could pull an untested major; the ceiling
+    # keeps prod on the same major the suite + lock run against. (>=16 is also where
+    # the websockets asyncio implementation chute relies on is the default.)
+    "websockets>=16,<17",
+    "cryptography>=42,<49",
 ]
 
 [project.urls]
@@ -46,6 +50,10 @@ dev = [
     "pytest-cov>=5.0",
     "mypy>=1.13",
     "build>=1.0",
+    "hypothesis>=6.0",
+]
+fuzz = [
+    "atheris>=3.0,<4",
 ]
 
 [project.scripts]
@@ -62,7 +70,7 @@ testpaths = ["tests"]
 [tool.ruff]
 target-version = "py311"
 line-length = 100
-src = ["src", "tests"]
+src = ["src", "tests", "fuzz"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "B", "UP"]

@@ -23,6 +23,18 @@ async def test_static_authorizer_rejects_wrong_or_empty_token():
     assert await auth.authenticate("S3CRET", None, None) is None  # case-sensitive
 
 
+async def test_static_authorizer_rejects_non_ascii_token_without_crashing():
+    # A non-ASCII token must be a clean reject, not a TypeError: hmac.compare_digest
+    # raises on a non-ASCII *str*, and the server's blanket except would mistake that
+    # crash for "authorizer unavailable" (retryable 1013) and skip the failed-auth
+    # limiter. Comparing as bytes makes it a normal rejection (F7).
+    auth = StaticTokenAuthorizer("s3cret")
+    assert await auth.authenticate("naïve-tøken", None, None) is None
+    assert await auth.authenticate("\U0001f4a9", "sub", "203.0.113.1") is None
+    # and a valid token still works after the byte change
+    assert (await auth.authenticate("s3cret", None, None)).account_id == "0"
+
+
 async def test_static_authorizer_ignores_subdomain_and_ip():
     # A single shared token grants the same thing regardless of requested name/IP;
     # label assignment still happens downstream in the relay.

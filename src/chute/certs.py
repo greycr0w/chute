@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import ipaddress
+import os
 import ssl
 from pathlib import Path
 
@@ -66,19 +67,32 @@ def generate(host: str, cert_path: Path, key_path: Path, *, days: int = 3650) ->
     )
 
     cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
-    key_path.write_bytes(
-        key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption(),
-        )
+    key_pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
     )
-    key_path.chmod(0o600)
+    # Create the key file 0600 from the first byte. write_bytes()+chmod() leaves a
+    # TOCTOU window where the private key sits on disk at the umask default (often
+    # 0644); open with a restrictive mode and fchmod() *before* writing so the key
+    # material never exists at a looser mode (O_TRUNC re-asserts 0600 on regen).
+    fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as fh:  # fdopen owns fd; closes it on exit
+        os.fchmod(fd, 0o600)
+        fh.write(key_pem)
 
 
 def server_ssl_context(cert_path: Path, key_path: Path) -> ssl.SSLContext:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
+    # Turn off TLS session-ticket resumption (1.2 STEK + 1.3 tickets). OpenSSL
+    # otherwise mints one session-ticket key at context creation and never rotates
+    # it for the whole process lifetime, so a later key leak retroactively breaks
+    # forward secrecy of every resumed session. The control channel is a single
+    # long-lived connection (no resumption value) and the edge-TLS path should
+    # match the documented nginx posture (`ssl_session_tickets off`) -- pure upside.
+    ctx.options |= ssl.OP_NO_TICKET
+    ctx.num_tickets = 0  # TLS 1.3: issue zero session tickets
     return ctx
 
 

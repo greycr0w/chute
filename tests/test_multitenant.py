@@ -1,9 +1,9 @@
-"""Multi-tenant routing: many agents, each owning a subdomain label.
+"""Host-label routing: many agents, each owning a subdomain label.
 
 When the server is given a ``base_domain`` it routes each public request by its
 Host header to the agent that owns that label, and hands every agent a
-``<label>.<base_domain>`` URL. The single-tenant path (no base_domain) is
-untouched -- see test_e2e_localhost.py / test_transparency.py for that.
+``<label>.<base_domain>`` URL. Without a base domain, the same registry/relay
+path is used under the reserved internal ``default`` label.
 
 There's no nginx here: we drive the server's plain-HTTP public port directly
 with a hand-built request carrying a chosen Host, exactly as nginx would after
@@ -24,7 +24,7 @@ from pathlib import Path
 import pytest
 import websockets
 
-from chute import certs, names
+from chute import certs, names, protocol
 from chute.client import Tunnel
 from chute.server import Server
 
@@ -93,8 +93,29 @@ def _raw_get(port: int, host_header: str, path: str = "/") -> tuple[int, dict[st
         conn.close()
 
 
+def _raw_send(port: int, raw: bytes) -> bytes:
+    """Send hand-crafted request bytes (the malformed shapes http.client would
+    refuse to form) and return the whole raw response. Used to assert that an
+    ambiguous head gets a 400 on the wire and never reaches an agent."""
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as s:
+        s.sendall(raw)
+        chunks: list[bytes] = []
+        while True:
+            buf = s.recv(4096)
+            if not buf:
+                break
+            chunks.append(buf)
+    return b"".join(chunks)
+
+
 @contextlib.asynccontextmanager
-async def _multi(tmp_path: Path, agents: list[tuple[str | None, str]], *, scheme: str = "http"):
+async def _multi(
+    tmp_path: Path,
+    agents: list[tuple[str | None, str]],
+    *,
+    scheme: str = "http",
+    include_server: bool = False,
+):
     """Spin up a multi-tenant server + one agent per (requested_subdomain, marker)."""
     cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
     certs.generate("127.0.0.1", cert, key)
@@ -129,7 +150,10 @@ async def _multi(tmp_path: Path, agents: list[tuple[str | None, str]], *, scheme
             tasks.append(asyncio.ensure_future(t.serve_forever()))
             await t.wait_until_ready(timeout=5)
             tunnels.append(t)
-        yield public_port, tunnels
+        if include_server:
+            yield public_port, tunnels, server
+        else:
+            yield public_port, tunnels
     finally:
         for t in tunnels:
             await t.aclose()
@@ -152,6 +176,12 @@ async def test_requested_subdomain_is_honored(tmp_path: Path) -> None:
         assert tunnels[0].public_url == f"http://myapp.{BASE}/"
 
 
+async def test_explicit_http_stays_http_when_https_is_available(tmp_path: Path) -> None:
+    async with _multi(tmp_path, [("plain", "P")], scheme="http") as (_port, tunnels):
+        assert tunnels[0].subdomain == "plain"
+        assert tunnels[0].public_url == f"http://plain.{BASE}/"
+
+
 async def test_auto_subdomain_assigned_and_routes(tmp_path: Path) -> None:
     async with _multi(tmp_path, [(None, "Z")]) as (port, tunnels):
         label = tunnels[0].subdomain
@@ -165,6 +195,63 @@ async def test_unknown_subdomain_returns_503(tmp_path: Path) -> None:
     async with _multi(tmp_path, [("alpha", "A")]) as (port, _tunnels):
         s, _, _ = await asyncio.to_thread(_raw_get, port, f"nobody.{BASE}")
         assert s == 503
+
+
+async def test_ambiguous_head_gets_400_and_is_not_routed(tmp_path: Path) -> None:
+    # A request a downstream hop could parse differently must be refused (400) and
+    # must never reach the agent -- otherwise it's a routing/smuggling primitive.
+    # The body marker "A:" only appears if the request actually hit agent alpha.
+    malformed = [
+        # malformed request-line shapes must fail before Host routing.
+        f"GET\r\nHost: alpha.{BASE}\r\n\r\n".encode(),
+        f"GET / HTTP/1.1 extra\r\nHost: alpha.{BASE}\r\n\r\n".encode(),
+        f"GET *garbage HTTP/1.1\r\nHost: alpha.{BASE}\r\n\r\n".encode(),
+        # duplicate Host: the old parser picked the first; a smuggler put the
+        # victim second so the app behind saw a different host than we routed on.
+        f"GET / HTTP/1.1\r\nHost: alpha.{BASE}\r\nHost: alpha.{BASE}\r\n\r\n".encode(),
+        # whitespace before the colon (the CVE-2019-16276 shape).
+        f"GET / HTTP/1.1\r\nHost : alpha.{BASE}\r\n\r\n".encode(),
+        # obs-fold: an indented continuation masquerading as the Host line.
+        f"GET / HTTP/1.1\r\nX-Pad: y\r\n\tHost: alpha.{BASE}\r\n\r\n".encode(),
+    ]
+    async with _multi(tmp_path, [("alpha", "A")], include_server=True) as (
+        port,
+        _tunnels,
+        server,
+    ):
+        for raw in malformed:
+            before = server._agents["alpha"].mux.stats()["opened"]
+            resp = await asyncio.to_thread(_raw_send, port, raw)
+            assert resp.startswith(b"HTTP/1.1 400"), resp[:64]
+            assert b"A:" not in resp  # never routed to alpha's app
+            assert server._agents["alpha"].mux.stats()["opened"] == before
+
+
+async def test_direct_host_routing_commits_connection_to_first_request(tmp_path: Path) -> None:
+    # This is the cloud deployment invariant in executable form: chute routes once
+    # per TCP connection, so nginx must not reuse one upstream connection for
+    # requests targeting different labels.
+    raw = (
+        f"GET /one HTTP/1.1\r\nHost: alpha.{BASE}\r\nConnection: keep-alive\r\n\r\n"
+        f"GET /two HTTP/1.1\r\nHost: beta.{BASE}\r\nConnection: close\r\n\r\n"
+    ).encode()
+    async with _multi(tmp_path, [("alpha", "A"), ("beta", "B")]) as (port, _tunnels):
+        resp = await asyncio.to_thread(_raw_send, port, raw)
+        assert b"A:/one" in resp
+        assert b"A:/two" in resp
+        assert b"B:/two" not in resp
+
+
+def test_multitenant_is_loopback_only() -> None:
+    # Multi-tenant routes per connection, so a routable bind is a cross-tenant
+    # request-bleed: the ctor must fail closed, not warn-and-run.
+    with pytest.raises(ValueError, match="loopback-only"):
+        Server(token="x", base_domain=BASE, public_host="0.0.0.0")
+    with pytest.raises(ValueError, match="loopback-only"):
+        Server(token="x", base_domain=BASE, public_host="203.0.113.7")
+    # Loopback multi-tenant is fine; single-tenant never routes, so any bind is fine.
+    Server(token="x", base_domain=BASE, public_host="127.0.0.1")
+    Server(token="x", public_host="0.0.0.0")
 
 
 async def test_routed_path_is_transparent(tmp_path: Path) -> None:
@@ -207,7 +294,16 @@ async def test_server_rejects_invalid_subdomain(tmp_path: Path) -> None:
         async with websockets.connect(
             f"wss://127.0.0.1:{control_port}", ssl=ctx, open_timeout=5
         ) as ws:
-            await ws.send(json.dumps({"type": "auth", "token": "secret", "subdomain": "bad_label"}))
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "auth",
+                        "token": "secret",
+                        "subdomain": "bad_label",
+                        "v": protocol.VERSION,
+                    }
+                )
+            )
             reply = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
             assert reply["type"] == "error"
             assert reply["reason"] == "invalid_subdomain"

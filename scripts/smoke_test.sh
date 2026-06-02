@@ -14,6 +14,12 @@ set -euo pipefail
 : "${CHUTE_SERVER_CERT:?set CHUTE_SERVER_CERT}"
 : "${CHUTE_PUBLIC_URL:?set CHUTE_PUBLIC_URL}"
 
+case "$CHUTE_PUBLIC_URL" in
+  http://*) CHUTE_SCHEME=http ;;
+  https://*) CHUTE_SCHEME=https ;;
+  *) echo "CHUTE_PUBLIC_URL must start with http:// or https://" >&2; exit 2 ;;
+esac
+
 PORT=8000
 MARKER="chute-smoke-$$"
 TMPDIR_LOCAL="$(mktemp -d)"
@@ -24,7 +30,7 @@ echo "==> starting local app on :$PORT"
 APP_PID=$!
 
 echo "==> starting chute agent"
-chute "$PORT" &
+chute "$CHUTE_SCHEME" "$PORT" &
 AGENT_PID=$!
 
 cleanup() { kill "$APP_PID" "$AGENT_PID" 2>/dev/null || true; rm -rf "$TMPDIR_LOCAL"; }

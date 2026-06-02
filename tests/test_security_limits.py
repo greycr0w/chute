@@ -110,9 +110,12 @@ async def test_visitor_cap_returns_503(tmp_path: Path, monkeypatch) -> None:
         await _quiet_cancel(task)
 
 
-# -- 3. a stalled consumer's stream is reset, not buffered forever ------------
-async def test_stream_queue_overflow_resets(monkeypatch) -> None:
-    monkeypatch.setattr(chute.mux, "_STREAM_QUEUE_MAX", 2)
+# -- 3. a peer that floods past the hard backstop is reset (flow-control net) --
+async def test_stream_flood_past_backstop_resets(monkeypatch) -> None:
+    # With credit-window flow control a compliant peer never overflows; this is the
+    # backstop for a peer that IGNORES its window and floods us -- a protocol
+    # violation -> RESET, with the consumer woken (not buffered without bound).
+    monkeypatch.setattr(chute.mux, "_STREAM_HARD_MAX", 10)
 
     class _FakeWS:
         def __init__(self) -> None:
@@ -123,18 +126,21 @@ async def test_stream_queue_overflow_resets(monkeypatch) -> None:
 
     ws = _FakeWS()
     mux = Mux(ws)
-    s = Stream(mux, 5)  # tiny queue (maxsize=2) via the monkeypatch
+    s = Stream(mux, 5)
     mux._streams[5] = s
 
-    s._feed(b"a")
-    s._feed(b"b")
-    s._feed(b"c")  # overflow -> schedules a RESET and drops the stream
+    s._feed(b"12345")
+    s._feed(b"67890")  # buffered == 10, still within the backstop
+    s._feed(b"over")  # 14 > 10 -> overflow -> schedules a RESET, drops the stream
     await asyncio.sleep(0.05)  # let the scheduled reset() task run
 
     sent_types = [protocol.decode(m)[0] for m in ws.sent]
-    assert protocol.RESET in sent_types, "overflowing stream must be RESET"
+    assert protocol.RESET in sent_types, "a peer flooding past the backstop must be RESET"
     assert 5 not in mux._streams, "overflowing stream must be removed"
     assert s.reset_by_peer is True
+    assert await s.read() == b"12345"
+    assert await s.read() == b"67890"
+    assert await s.read() is None
 
 
 # -- 4. CA:FALSE — a leaf minted FROM the pinned cert is rejected -------------
@@ -193,6 +199,49 @@ async def test_pinned_cert_cannot_sign_trusted_children(tmp_path: Path) -> None:
         await server.wait_closed()
 
 
+# -- 6. a deeply-nested hello closes cleanly (4000), not an uncaught 1011 -------
+async def test_nested_json_hello_closes_cleanly(tmp_path: Path) -> None:
+    # json.loads on a deeply-nested payload raises RecursionError (a RuntimeError,
+    # not ValueError/TypeError). Before the fix it escaped the hello except -> an
+    # uncaught 1011 (retryable, so real clients reconnect-loop) that also skipped
+    # the failed-auth limiter. It must be the benign close-4000 path instead (F36).
+    cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
+    certs.generate("127.0.0.1", cert, key)
+    cp = _free_port()
+    server = Server(
+        token="secret",
+        public_host="127.0.0.1",
+        public_port=_free_port(),
+        control_host="127.0.0.1",
+        control_port=cp,
+        ssl_context=certs.server_ssl_context(cert, key),
+    )
+    task = asyncio.ensure_future(server.serve())
+    await asyncio.sleep(0.3)
+    try:
+        ctx = certs.client_ssl_context(cert)
+        async with websockets.connect(f"wss://127.0.0.1:{cp}", ssl=ctx, open_timeout=5) as ws:
+            await ws.send("[" * 100_000)  # sub-max_size, but blows json's recursion
+            with pytest.raises(websockets.exceptions.ConnectionClosed):
+                await asyncio.wait_for(ws.recv(), timeout=5)
+            assert ws.close_code == 4000  # clean "bad handshake", not 1011
+    finally:
+        await _quiet_cancel(task)
+
+
+# -- 7. server TLS context disables session-ticket resumption (forward secrecy)-
+def test_server_ssl_context_disables_session_tickets(tmp_path: Path) -> None:
+    # OpenSSL otherwise mints one session-ticket key at context creation and never
+    # rotates it for the process lifetime; a later leak retroactively breaks the
+    # forward secrecy of every resumed session. Both the control channel and the
+    # edge-TLS listener use this context, so both must refuse resumption (F45).
+    cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
+    certs.generate("127.0.0.1", cert, key)
+    ctx = certs.server_ssl_context(cert, key)
+    assert ctx.options & ssl.OP_NO_TICKET  # TLS 1.2 STEK off
+    assert ctx.num_tickets == 0  # TLS 1.3 tickets off
+
+
 # -- 5. control channel negotiates no permessage-deflate (no zip-bomb surface)-
 async def test_control_channel_disables_compression(tmp_path: Path) -> None:
     cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
@@ -218,3 +267,14 @@ async def test_control_channel_disables_compression(tmp_path: Path) -> None:
             assert "permessage-deflate" not in exts.lower()
     finally:
         await _quiet_cancel(task)
+
+
+def test_auth_fail_map_is_hard_capped(monkeypatch) -> None:
+    # A flood of FRESH distinct IPs sweeps no stale buckets, so the per-IP failure map
+    # must be hard-capped (oldest-inserted evicted), not grow without bound.
+    monkeypatch.setattr(chute.server, "_AUTH_FAIL_SWEEP_AT", 8)
+    monkeypatch.setattr(chute.server, "_AUTH_FAIL_MAX_IPS", 16)
+    srv = Server(token="x")
+    for i in range(200):
+        srv._record_auth_fail(f"2001:db8::{i:x}")  # all fresh within the window
+    assert len(srv._auth_fails) <= 16

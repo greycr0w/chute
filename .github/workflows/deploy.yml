@@ -44,7 +44,7 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
           # Host key is pinned (StrictHostKeyChecking=yes + our known_hosts), and
-          # the key is forced-command locked server-side; the "deploy" arg is
-          # advisory. A non-zero exit (failed restart / nginx -t) fails the run.
+          # the key is forced-command locked server-side. A non-zero exit
+          # (failed install / restart / nginx -t) fails the run.
           ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
             "$SSH_USER@$SSH_HOST" deploy

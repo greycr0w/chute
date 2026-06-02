@@ -23,6 +23,7 @@ REMOTE="${1:?usage: deploy.sh user@host}"
 BASE_DOMAIN="${CHUTE_BASE_DOMAIN:-chute.sh}"
 PUBLIC_PORT="${CHUTE_PUBLIC_PORT:-8080}"
 CONTROL_PORT="${CHUTE_CONTROL_PORT:-7000}"
+CERT_ROOT="${CHUTE_CERT_ROOT:-/home/letsencrypt/chute/certs}"
 # Optional: space-separated CIDRs allowed to reach the control port. When set
 # (and ufw is already active on the box) the deploy restricts the port to these;
 # otherwise it just prints the commands. The agent dials OUT, so the control
@@ -40,19 +41,23 @@ rsync -az --delete \
 echo "==> [2/2] installing on the box (venv + systemd + nginx)"
 ssh "$REMOTE" \
   BASE_DOMAIN="$BASE_DOMAIN" PUBLIC_PORT="$PUBLIC_PORT" CONTROL_PORT="$CONTROL_PORT" \
-  AGENT_CIDRS="$AGENT_CIDRS" \
+  CERT_ROOT="$CERT_ROOT" AGENT_CIDRS="$AGENT_CIDRS" \
   'bash -s' <<'REMOTE_SCRIPT'
 set -euo pipefail
-: "${BASE_DOMAIN:?}" "${PUBLIC_PORT:?}" "${CONTROL_PORT:?}"
+: "${BASE_DOMAIN:?}" "${PUBLIC_PORT:?}" "${CONTROL_PORT:?}" "${CERT_ROOT:?}"
 
 # 1) dedicated service user (no shell, no home churn)
 id -u chute >/dev/null 2>&1 || \
   useradd --system --home-dir /opt/chute --shell /usr/sbin/nologin chute
 
-# 2) venv + install (re-installs on every deploy => picks up new code)
+# 2) venv + install. Runtime deps come from the HASH-PINNED lock export
+# (deploy/requirements.txt, generated from uv.lock) so prod runs the exact versions
+# CI tested -- not whatever pip resolves fresh. chute itself is then installed
+# --no-deps (its runtime deps are already pinned by the line above).
 python3 -m venv /opt/chute/.venv
 /opt/chute/.venv/bin/pip install --quiet --upgrade pip
-/opt/chute/.venv/bin/pip install --quiet --upgrade /opt/chute/src
+/opt/chute/.venv/bin/pip install --quiet --require-hashes -r /opt/chute/src/deploy/requirements.txt
+/opt/chute/.venv/bin/pip install --quiet --no-deps /opt/chute/src
 
 # 3) control-channel pinned cert (generated ONCE; the client pins this exact file)
 if [ ! -f /opt/chute/chute-cert.pem ]; then
@@ -61,11 +66,16 @@ if [ ! -f /opt/chute/chute-cert.pem ]; then
     --cert /opt/chute/chute-cert.pem --key /opt/chute/chute-key.pem
 fi
 
-# 4) env file with the shared token (generated ONCE, preserved on re-runs)
-if [ ! -f /etc/chute/chute.env ]; then
+# 4) candidate env with the shared token preserved, but runtime values regenerated
+# on every deploy. nginx is rendered from these same effective values below; the
+# candidate is committed only after nginx validates.
+if [ -f /etc/chute/chute.env ] && grep -q '^CHUTE_TOKEN=' /etc/chute/chute.env; then
+  TOKEN="$(grep '^CHUTE_TOKEN=' /etc/chute/chute.env | cut -d= -f2-)"
+else
   echo "    generating shared token (one time)"
   TOKEN="$(/opt/chute/.venv/bin/chuted gen-token)"
-  cat > /etc/chute/chute.env <<EOF
+fi
+cat > /etc/chute/chute.env.new <<EOF
 CHUTE_TOKEN=$TOKEN
 CHUTE_BASE_DOMAIN=$BASE_DOMAIN
 CHUTE_UPSTREAM_TLS=1
@@ -76,25 +86,69 @@ CHUTE_CONTROL_PORT=$CONTROL_PORT
 CHUTE_CERT=/opt/chute/chute-cert.pem
 CHUTE_KEY=/opt/chute/chute-key.pem
 EOF
-fi
-chmod 600 /etc/chute/chute.env
+chmod 600 /etc/chute/chute.env.new
+chown chute:chute /etc/chute/chute.env.new
 chown -R chute:chute /opt/chute /etc/chute
+chgrp -R chute /opt/chute/.venv
+chmod -R g+rwX /opt/chute/.venv
+find /opt/chute/.venv -type d -exec chmod g+s {} +
 
-# 5) systemd unit
+# 5) nginx wildcard vhost (specific server_name => other vhosts untouched).
+# Install the candidate config, validate it, and restore the old file on failure.
+# chuted is not restarted until this succeeds, so it cannot advertise HTTPS before
+# nginx can truthfully serve it.
+_sed_escape() { printf '%s' "$1" | sed 's/[\/&]/\\&/g'; }
+BASE_DOMAIN_ESC="$(_sed_escape "$BASE_DOMAIN")"
+PUBLIC_PORT_ESC="$(_sed_escape "$PUBLIC_PORT")"
+CERT_ROOT_ESC="$(_sed_escape "$CERT_ROOT")"
+NGINX_CONF=/etc/nginx/sites-available/chute.conf
+NGINX_LINK=/etc/nginx/sites-enabled/chute.conf
+NGINX_BACKUP="$(mktemp)"
+NGINX_HAD_CONF=0
+NGINX_HAD_LINK=0
+if [ -f "$NGINX_CONF" ]; then
+  cp "$NGINX_CONF" "$NGINX_BACKUP"
+  NGINX_HAD_CONF=1
+fi
+if [ -e "$NGINX_LINK" ] || [ -L "$NGINX_LINK" ]; then
+  NGINX_HAD_LINK=1
+fi
+_restore_nginx_candidate() {
+  if [ "$NGINX_HAD_CONF" = "1" ]; then
+    cp "$NGINX_BACKUP" "$NGINX_CONF"
+  else
+    rm -f "$NGINX_CONF"
+  fi
+  if [ "$NGINX_HAD_LINK" = "0" ]; then
+    rm -f "$NGINX_LINK"
+  fi
+  rm -f "$NGINX_BACKUP"
+}
+sed \
+  -e "s/__BASE_DOMAIN__/$BASE_DOMAIN_ESC/g" \
+  -e "s/__PUBLIC_PORT__/$PUBLIC_PORT_ESC/g" \
+  -e "s/__CERT_ROOT__/$CERT_ROOT_ESC/g" \
+  /opt/chute/src/deploy/nginx-chute.conf > "$NGINX_CONF"
+ln -sf "$NGINX_CONF" "$NGINX_LINK"
+if nginx -t; then
+  rm -f "$NGINX_BACKUP"
+else
+  echo "!!! nginx -t FAILED -- left the running config untouched, fix and re-run" >&2
+  _restore_nginx_candidate
+  rm -f /etc/chute/chute.env.new
+  exit 1
+fi
+
+# 6) commit daemon env + systemd unit only after nginx validates, then restart.
+mv /etc/chute/chute.env.new /etc/chute/chute.env
+chmod 600 /etc/chute/chute.env
+chown chute:chute /etc/chute/chute.env
 cp /opt/chute/src/deploy/chuted.service /etc/systemd/system/chuted.service
+install -m 0755 -o root -g root /opt/chute/src/deploy/deploy-pull.sh /usr/local/sbin/chute-deploy-pull
 systemctl daemon-reload
 systemctl enable chuted >/dev/null 2>&1 || true
 systemctl restart chuted
-
-# 6) nginx wildcard vhost (specific server_name => other vhosts untouched)
-cp /opt/chute/src/deploy/nginx-chute.conf /etc/nginx/sites-available/chute.conf
-ln -sf /etc/nginx/sites-available/chute.conf /etc/nginx/sites-enabled/chute.conf
-if nginx -t; then
-  systemctl reload nginx
-else
-  echo "!!! nginx -t FAILED -- left the running config untouched, fix and re-run" >&2
-  exit 1
-fi
+systemctl reload nginx
 
 # 7) optionally restrict the pre-auth control port to known agent source IP(s)
 if [ -n "${AGENT_CIDRS:-}" ]; then

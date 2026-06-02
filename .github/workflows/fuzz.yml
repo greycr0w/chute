@@ -1,0 +1,89 @@
+name: Fuzz
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hypothesis-and-atheris:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          enable-cache: true
+      - name: Choose fuzz depth
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "schedule" ] || [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "HYPOTHESIS_PROFILE=ci-deep" >> "$GITHUB_ENV"
+            echo "ATHERIS_RUNS=10000" >> "$GITHUB_ENV"
+          else
+            echo "HYPOTHESIS_PROFILE=chute" >> "$GITHUB_ENV"
+            echo "ATHERIS_RUNS=1000" >> "$GITHUB_ENV"
+          fi
+      - name: Install locked fuzz environment
+        run: uv sync --locked --extra dev --extra fuzz --python 3.11
+      - name: Structure-aware fuzz tests
+        run: uv run --no-sync pytest -q tests/test_fuzz_mux.py tests/test_fuzz_harnesses.py tests/test_host_parsing.py
+      - name: Atheris bounded fuzzers
+        run: uv run --no-sync python -m fuzz.run_atheris --runs "$ATHERIS_RUNS"
+
+  clusterfuzzlite-code-change:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Build fuzzers
+        id: build
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: python
+          sanitizer: address
+      - name: Run code-change fuzzing
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 600
+          mode: code-change
+          sanitizer: address
+          parallel-fuzzing: true
+
+  clusterfuzzlite-batch:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Build fuzzers
+        id: build
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: python
+          sanitizer: address
+      - name: Run batch fuzzing
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 3600
+          mode: batch
+          sanitizer: address
+          parallel-fuzzing: true
