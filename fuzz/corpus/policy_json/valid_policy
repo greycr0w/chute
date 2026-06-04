@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "credentials": [
+    {
+      "credential_id": "cred-a",
+      "token_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "account_id": "acct-a",
+      "max_tunnels": 2,
+      "allowed_label": "dev",
+      "budget": {
+        "max_visitors": 4,
+        "max_bytes_per_sec": 1024,
+        "max_reconnects_per_min": 3,
+        "max_buffered_bytes": 2048
+      },
+      "lease_seconds": 60
+    }
+  ]
+}

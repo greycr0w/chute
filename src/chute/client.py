@@ -43,7 +43,9 @@ from pathlib import Path
 import websockets
 
 from . import certs, names, protocol
-from .mux import Mux, Stream
+from ._relay import _pump_reader_to_stream, _pump_stream_to_writer, _safe_close, _safe_reset
+from ._sockets import enable_tcp_keepalive
+from .mux import _FLOW_WINDOW, Mux, Stream, validate_flow_window
 
 log = logging.getLogger("chute.client")
 
@@ -52,7 +54,12 @@ log = logging.getLogger("chute.client")
 # single message. compression is disabled to mirror the server (no permessage-
 # deflate). Neither touches proxied bytes -- they ride inside DATA frames.
 _MAX_WS_MESSAGE = 256 * 1024
-_DRAIN_TIMEOUT = 120.0
+_WS_MAX_QUEUE = 16
+# Keep this positive. Forcing an SSL transport's write-buffer high-water mark to
+# 0 can deadlock `drain()` on Python 3.11+; chute should bound writes with timeouts,
+# not by disabling the transport buffer.
+_WS_WRITE_LIMIT = 32 * 1024
+_STREAM_READER_LIMIT = 64 * 1024
 # How long a graceful stop (Ctrl-C / aclose) waits for in-flight requests to finish
 # before closing -- mirrors the server's drain grace. A permanent SSE/WS stream is
 # force-closed at the deadline.
@@ -61,6 +68,7 @@ _AGENT_DRAIN_TIMEOUT = 10.0
 # full listen backlog would otherwise pin the stream for the full OS connect window
 # (minutes). Matches nginx proxy_connect_timeout / cloudflared connectTimeout.
 _LOCAL_CONNECT_TIMEOUT = 10.0
+_LOCAL_UNREACHABLE_LOG_INTERVAL = 60.0
 
 # Control-channel close codes the agent must NOT retry: a rejected token (4001) or
 # a rejected subdomain / over-limit (4002) won't be fixed by reconnecting. Every
@@ -83,6 +91,7 @@ class Tunnel:
         max_backoff: float = 30.0,
         scheme: str = "https",
         subdomain: str | None = None,
+        mux_flow_window: int = _FLOW_WINDOW,
     ) -> None:
         if scheme not in ("http", "https"):
             raise ValueError(f"scheme must be 'http' or 'https', got {scheme!r}")
@@ -97,6 +106,7 @@ class Tunnel:
         self.control_port = control_port
         self.server_cert = Path(server_cert) if server_cert else None
         self.max_backoff = max_backoff
+        self.mux_flow_window = validate_flow_window(mux_flow_window, name="mux_flow_window")
         # Which scheme the PUBLIC endpoint serves. "https" asks the server to
         # terminate TLS at its edge; the agent still speaks plaintext to the
         # local app, and the public cert lives on the server -- never here.
@@ -108,9 +118,12 @@ class Tunnel:
         # Populated once the tunnel is ready:
         self.public_url: str | None = None
         self.subdomain: str | None = None  # the label the server actually assigned
+        self.negotiated_mux_flow_window: int | None = None
         self._ready_error: _FatalError | None = None
         self._stop = asyncio.Event()
         self._connected = asyncio.Event()
+        self._local_unreachable_next_log = 0.0
+        self._local_unreachable_suppressed = 0
 
         # only used by the threaded start()/stop() convenience wrapper
         self._thread: threading.Thread | None = None
@@ -129,6 +142,7 @@ class Tunnel:
             self._ready_error = None
             self.public_url = None
             self.subdomain = None
+            self.negotiated_mux_flow_window = None
             try:
                 await self._run_once()
                 attempt = 0  # clean disconnect (e.g. server restart): retry fast
@@ -179,6 +193,8 @@ class Tunnel:
             ping_interval=20,
             ping_timeout=20,
             max_size=_MAX_WS_MESSAGE,
+            max_queue=_WS_MAX_QUEUE,
+            write_limit=_WS_WRITE_LIMIT,
             compression=None,
             open_timeout=15,
         ) as ws:
@@ -186,6 +202,7 @@ class Tunnel:
                 "type": "auth",
                 "token": self.token,
                 "scheme": self.scheme,
+                "flow_window": self.mux_flow_window,
                 "v": protocol.VERSION,
             }
             if self._requested_subdomain:
@@ -225,14 +242,28 @@ class Tunnel:
                 # A "ready" with no usable URL is a protocol error, not a transport
                 # hiccup -- don't KeyError into a silent retry loop (old reply["..."]).
                 raise _FatalError("handshake reply missing public_url")
+            try:
+                flow_window = validate_flow_window(reply.get("flow_window"))
+            except ValueError as exc:
+                raise _FatalError(f"handshake reply invalid flow_window: {exc}") from exc
+            if flow_window > self.mux_flow_window:
+                raise _FatalError(
+                    f"server flow_window={flow_window} exceeds requested {self.mux_flow_window}"
+                )
 
             self.public_url = url
             self._ready_error = None
             self.subdomain = reply.get("subdomain")  # None for the default route
+            self.negotiated_mux_flow_window = flow_window
             self._connected.set()
             log.info("tunnel ready -> %s", self.public_url)
 
-            mux = Mux(ws, on_open=self._handle_stream, on_goaway=self._on_server_goaway)
+            mux = Mux(
+                ws,
+                on_open=self._handle_stream,
+                on_goaway=self._on_server_goaway,
+                flow_window=flow_window,
+            )
             run_task = asyncio.ensure_future(mux.run())
             stop_task = asyncio.ensure_future(self._stop.wait())
             await asyncio.wait({run_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
@@ -259,27 +290,76 @@ class Tunnel:
 
     # -- per-request handling --------------------------------------------------
     async def _handle_stream(self, stream: Stream) -> None:
+        writer: asyncio.StreamWriter | None = None
         try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(self.local_host, self.local_port),
-                timeout=_LOCAL_CONNECT_TIMEOUT,
-            )
-        except (OSError, TimeoutError) as exc:
-            # TimeoutError: a blackholed local port (SYN dropped) or a full listen
-            # backlog -- bound it instead of pinning the stream for the OS connect
-            # window. Both failure modes get the same RESET-and-move-on handling.
-            log.warning("local app unreachable (%s:%s): %s", self.local_host, self.local_port, exc)
-            await _safe_reset(stream)
-            return
-        try:
-            async with asyncio.TaskGroup() as tg:
-                tg.create_task(_pump_stream_to_local(stream, writer))
-                tg.create_task(_pump_local_to_stream(reader, stream))
-        except* Exception:
-            await _safe_reset(stream)
+            try:
+                reader, local_writer = await asyncio.wait_for(
+                    asyncio.open_connection(
+                        self.local_host,
+                        self.local_port,
+                        limit=_STREAM_READER_LIMIT,
+                    ),
+                    timeout=_LOCAL_CONNECT_TIMEOUT,
+                )
+                writer = local_writer
+            except (OSError, TimeoutError) as exc:
+                # TimeoutError: a blackholed local port (SYN dropped) or a full listen
+                # backlog -- bound it instead of pinning the stream for the OS connect
+                # window. Both failure modes get the same RESET-and-move-on handling.
+                self._record_local_unreachable(exc)
+                await _safe_reset(stream)
+                return
+            # OS-level keepalive catches a local app peer that vanished without FIN/RST,
+            # without imposing an application idle timeout on valid long-lived streams.
+            enable_tcp_keepalive(local_writer)
+            self._record_local_reachable()
+            try:
+                async with asyncio.TaskGroup() as tg:
+                    # A normal EOF from either pump is a half-close, not a sibling
+                    # cancellation. TaskGroup keeps the other direction alive unless
+                    # a pump raises, so delayed response bodies still drain.
+                    tg.create_task(_pump_stream_to_writer(stream, local_writer))
+                    tg.create_task(_pump_reader_to_stream(reader, stream))
+            except* Exception:
+                await _safe_reset(stream)
         finally:
-            _safe_close(writer)
+            if writer is not None:
+                _safe_close(writer)
             stream.close()
+
+    def _record_local_unreachable(self, exc: BaseException) -> None:
+        now = asyncio.get_running_loop().time()
+        if now < self._local_unreachable_next_log:
+            self._local_unreachable_suppressed += 1
+            return
+        if self._local_unreachable_suppressed:
+            log.warning(
+                "local app unreachable (%s:%s): %s (suppressed %d similar failures)",
+                self.local_host,
+                self.local_port,
+                exc,
+                self._local_unreachable_suppressed,
+            )
+        else:
+            log.warning(
+                "local app unreachable (%s:%s): %s",
+                self.local_host,
+                self.local_port,
+                exc,
+            )
+        self._local_unreachable_suppressed = 0
+        self._local_unreachable_next_log = now + _LOCAL_UNREACHABLE_LOG_INTERVAL
+
+    def _record_local_reachable(self) -> None:
+        if self._local_unreachable_suppressed:
+            log.info(
+                "local app reachable again (%s:%s); suppressed %d unreachable warnings",
+                self.local_host,
+                self.local_port,
+                self._local_unreachable_suppressed,
+            )
+        self._local_unreachable_suppressed = 0
+        self._local_unreachable_next_log = 0.0
 
     # -- threaded convenience wrapper -----------------------------------------
     def start(self) -> Tunnel:
@@ -353,60 +433,3 @@ class Tunnel:
 
 class _FatalError(Exception):
     """Auth/handshake errors that retrying cannot fix."""
-
-
-# -- relay pumps: after server-side HTTP-head admission, bytes pass through verbatim.
-async def _pump_stream_to_local(stream: Stream, writer: asyncio.StreamWriter) -> None:
-    while True:
-        chunk = await stream.read()
-        if chunk is None:
-            if stream.reset_by_peer:
-                # Request was aborted/truncated, not cleanly finished: RST the local
-                # socket so the app doesn't treat a partial request as complete, and
-                # so the sibling pump unblocks. (F22)
-                _safe_abort(writer)
-            elif writer.can_write_eof():
-                # Clean half-close; suppress so a best-effort EOF can't raise out of
-                # the pump and tear the TaskGroup down.
-                with contextlib.suppress(Exception):
-                    writer.write_eof()
-            else:
-                _safe_close(writer)
-            return
-        writer.write(chunk)
-        # Bound a stalled local app so it can't pin the stream/buffer forever.
-        await asyncio.wait_for(writer.drain(), timeout=_DRAIN_TIMEOUT)
-        # Bytes accepted by the local app: return that much credit to the server.
-        await stream.ack(len(chunk))
-
-
-async def _pump_local_to_stream(reader: asyncio.StreamReader, stream: Stream) -> None:
-    while True:
-        data = await reader.read(65536)
-        if not data:
-            await stream.send_eof()
-            return
-        await stream.send(data)
-
-
-def _safe_close(writer: asyncio.StreamWriter) -> None:
-    try:
-        writer.close()
-    except Exception:
-        pass
-
-
-def _safe_abort(writer: asyncio.StreamWriter) -> None:
-    # RST the local socket (asyncio-native): the right signal for an aborted relay,
-    # and it instantly unblocks a sibling pump parked on read().
-    try:
-        writer.transport.abort()
-    except Exception:
-        pass
-
-
-async def _safe_reset(stream: Stream) -> None:
-    try:
-        await stream.reset()
-    except Exception:
-        pass

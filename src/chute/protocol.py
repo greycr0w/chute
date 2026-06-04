@@ -29,7 +29,8 @@ import struct
 # stall or overflow rather than fail cleanly.
 #   v2: credit-window flow control (WINDOW_UPDATE).
 #   v3: graceful drain (GOAWAY).
-VERSION = 3
+#   v4: negotiated mux flow window in the JSON hello/ready handshake.
+VERSION = 4
 
 # Frame types -----------------------------------------------------------------
 OPEN = 0x01  # server -> agent: open a stream; agent dials the local target

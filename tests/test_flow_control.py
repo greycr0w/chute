@@ -1,4 +1,4 @@
-"""Credit-window flow control (protocol v2) at the mux layer.
+"""Credit-window flow control at the mux layer.
 
 These drive Stream/Mux directly with a fake WebSocket so the window mechanics are
 deterministic. The end-to-end >16 MiB transparency + slow-consumer tests live in
@@ -99,6 +99,61 @@ async def test_sender_resets_on_credit_stall(monkeypatch) -> None:
         await asyncio.wait_for(s.send(b"E"), timeout=2)
 
 
+async def test_send_eof_cannot_overtake_blocked_data(monkeypatch) -> None:
+    monkeypatch.setattr(chute.mux, "_FLOW_WINDOW", 1)
+    ws = _FakeWS()
+    s = Stream(Mux(ws), 1)
+
+    await s.send(b"A")
+    blocked_data = asyncio.ensure_future(s.send(b"B"))
+    await asyncio.sleep(0.05)
+    assert not blocked_data.done()
+
+    eof = asyncio.ensure_future(s.send_eof())
+    await asyncio.sleep(0.05)
+    assert not eof.done(), "EOF must wait behind the already-started DATA send"
+
+    s._grant(1)
+    await asyncio.wait_for(blocked_data, timeout=1)
+    await asyncio.wait_for(eof, timeout=1)
+
+    frames = [(t, p) for t, _sid, p in _frames(ws)]
+    assert frames == [
+        (protocol.DATA, b"A"),
+        (protocol.DATA, b"B"),
+        (protocol.EOF, b""),
+    ]
+
+
+async def test_send_chunks_to_websocket_message_limit() -> None:
+    ws = _FakeWS()
+    s = Stream(Mux(ws), 1)
+    payload = b"x" * (chute.mux._MAX_FRAME_PAYLOAD + 1)
+
+    await s.send(payload)
+
+    data_payloads = [p for t, _sid, p in _frames(ws) if t == protocol.DATA]
+    assert b"".join(data_payloads) == payload
+    assert all(len(p) <= chute.mux._MAX_FRAME_PAYLOAD for p in data_payloads)
+
+
+async def test_mux_custom_flow_window_derives_window_backstops() -> None:
+    mux = Mux(_FakeWS(), flow_window=10)
+    s = Stream(mux, 1)
+    mux._streams[1] = s
+
+    assert s._send_window == 10
+    assert mux.window_update_threshold == 5
+    assert mux.stream_hard_max == 20
+    assert mux.max_queued_frames == 10
+
+    s._feed(b"x" * 20)
+    assert s.reset_by_peer is False
+    s._feed(b"y")
+    await asyncio.sleep(0.05)
+    assert s.reset_by_peer is True
+
+
 # -- the backstop is window-relative and tolerates a full window of buffering --
 async def test_backstop_is_two_windows_and_tolerates_one(monkeypatch) -> None:
     assert chute.mux._STREAM_HARD_MAX == 2 * chute.mux._FLOW_WINDOW
@@ -110,6 +165,57 @@ async def test_backstop_is_two_windows_and_tolerates_one(monkeypatch) -> None:
     s._feed(b"y")  # 201 > 200 -> violation -> RESET
     await asyncio.sleep(0.05)
     assert s.reset_by_peer is True
+
+
+async def test_buffer_accounting_hooks_reserve_and_release_unread_bytes() -> None:
+    reserved: list[int] = []
+    released: list[int] = []
+
+    def reserve(n: int) -> bool:
+        reserved.append(n)
+        return True
+
+    def release(n: int) -> None:
+        released.append(n)
+
+    mux = Mux(_FakeWS(), buffer_reserve=reserve, buffer_release=release)
+    s = Stream(mux, 1)
+    mux._streams[1] = s
+
+    s._feed(b"abc")
+    assert reserved == [3]
+    assert mux._buffered == 3
+
+    assert await s.read() == b"abc"
+    assert released == [3]
+    assert mux._buffered == 0
+
+    s._feed(b"de")
+    s.close()
+    assert released == [3, 2]
+    assert mux._buffered == 0
+    assert await s.read() == b"de"
+    assert released == [3, 2], "post-close reads must not double-release"
+
+
+async def test_buffer_reserve_rejection_resets_without_queueing() -> None:
+    released: list[int] = []
+    mux = Mux(
+        _FakeWS(),
+        buffer_reserve=lambda _n: False,
+        buffer_release=lambda n: released.append(n),
+    )
+    s = Stream(mux, 1)
+    mux._streams[1] = s
+
+    s._feed(b"abc")
+    await asyncio.sleep(0.05)
+
+    assert s.reset_by_peer is True
+    assert mux._buffered == 0
+    assert mux._frames == 0
+    assert released == []
+    assert await s.read() is None
 
 
 # -- a reset delivers an ABORT terminal, distinguishable from a clean EOF ------
@@ -179,6 +285,58 @@ class _ScriptedWS:
         pass
 
 
+async def test_server_mux_ignores_peer_open_without_materializing_streams() -> None:
+    ws = _ScriptedWS(
+        [
+            protocol.encode(protocol.OPEN, 7, b""),
+            protocol.encode(protocol.OPEN, 8, b"unexpected-payload"),
+            protocol.encode(protocol.OPEN, 0, b""),
+        ]
+    )
+    mux = Mux(ws)  # server side: no on_open callback, so peer OPEN is never accepted
+    run_task = asyncio.ensure_future(mux.run())
+    try:
+        await asyncio.sleep(0.05)
+        assert mux.active_streams == 0
+        assert mux.stats()["ignored_frames"] == 3
+        assert mux._tasks == set()
+        assert ws.sent == []
+        assert not run_task.done(), "ignored peer OPENs must not close the mux connection"
+    finally:
+        run_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await run_task
+
+
+async def test_inbound_open_over_max_streams_is_reset_without_closing_mux() -> None:
+    opened: list[Stream] = []
+    started = asyncio.Event()
+
+    async def _on_open(stream: Stream) -> None:
+        opened.append(stream)
+        started.set()
+        await asyncio.sleep(60)  # keep the first handler live at the stream cap
+
+    ws = _ScriptedWS(
+        [protocol.encode(protocol.OPEN, 7, b""), protocol.encode(protocol.OPEN, 9, b"")]
+    )
+    mux = Mux(ws, on_open=_on_open, max_streams=1)
+    run_task = asyncio.ensure_future(mux.run())
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await asyncio.sleep(0.05)
+        assert [stream.id for stream in opened] == [7]
+        assert mux.active_streams == 1
+        assert mux.stats()["opened"] == 1
+        sent = [protocol.decode(m) for m in ws.sent]
+        assert [(t, sid) for t, sid, _p in sent] == [(protocol.RESET, 9)]
+        assert not run_task.done(), "stream-limit refusal must not close the mux connection"
+    finally:
+        run_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await run_task
+
+
 async def test_duplicate_open_is_reset() -> None:
     opened: list[Stream] = []
     started = asyncio.Event()
@@ -201,6 +359,62 @@ async def test_duplicate_open_is_reset() -> None:
         assert any(t == protocol.RESET and sid == 7 for t, sid, _p in sent), (
             "a duplicate OPEN for a live id must be RESET"
         )
+    finally:
+        run_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await run_task
+
+
+async def test_eof_payload_resets_stream_instead_of_clean_half_close() -> None:
+    terminals: list[tuple[bytes | None, bool]] = []
+    started = asyncio.Event()
+
+    async def _on_open(stream: Stream) -> None:
+        started.set()
+        chunk = await stream.read()
+        terminals.append((chunk, stream.reset_by_peer))
+
+    ws = _ScriptedWS(
+        [protocol.encode(protocol.OPEN, 7, b""), protocol.encode(protocol.EOF, 7, b"lost")]
+    )
+    mux = Mux(ws, on_open=_on_open)
+    run_task = asyncio.ensure_future(mux.run())
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await asyncio.sleep(0.05)
+        assert terminals == [(None, True)]
+        sent = [protocol.decode(m) for m in ws.sent]
+        assert any(t == protocol.RESET and sid == 7 for t, sid, _p in sent)
+    finally:
+        run_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await run_task
+
+
+class _BlockedSendWS(_ScriptedWS):
+    async def send(self, data: bytes) -> None:
+        await self._block.wait()
+        self.sent.append(data)
+
+
+async def test_duplicate_open_reset_send_is_deduplicated() -> None:
+    started = asyncio.Event()
+
+    async def _on_open(stream: Stream) -> None:
+        started.set()
+        await asyncio.sleep(60)
+
+    ws = _BlockedSendWS(
+        [protocol.encode(protocol.OPEN, 7, b"")]
+        + [protocol.encode(protocol.OPEN, 7, b"") for _ in range(50)]
+    )
+    mux = Mux(ws, on_open=_on_open)
+    run_task = asyncio.ensure_future(mux.run())
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await asyncio.sleep(0.05)
+        assert len(mux._reset_sends) == 1
+        assert len([task for task in mux._tasks if not task.done()]) <= 2
     finally:
         run_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):

@@ -3,8 +3,17 @@ from __future__ import annotations
 import asyncio
 import struct
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 from chute import names, protocol
+from chute.control import (
+    AccountBudgetUpdate,
+    LeaseRevocation,
+    PolicyUpdate,
+    _parse_static_policy_text,
+    _StaticCredential,
+    _StaticPolicy,
+)
 from chute.mux import _MAX_CONN_BUFFERED, _MAX_CONN_FRAMES, Mux, Stream
 from chute.server import Server, _BadRequest, _host_from_head, _parse_request_head
 
@@ -63,8 +72,22 @@ def check_request_head(data: bytes) -> None:
             assert parsed.host is not None
         if parsed.host is not None:
             assert parsed.host == _host_from_head(data)
-            assert parsed.host == parsed.host.strip()
-            assert all(0x21 <= ord(ch) <= 0x7E for ch in parsed.host)
+            _assert_normalized_host(parsed.host)
+
+
+def _assert_normalized_host(host: str) -> None:
+    assert host == host.strip()
+    assert host == host.lower()
+    assert all(0x21 <= ord(ch) <= 0x7E for ch in host)
+    assert host
+    assert "@" not in host
+    if host.startswith("["):
+        assert host.endswith("]")
+        return
+    assert ":" not in host
+    rootless = host[:-1] if host.endswith(".") else host
+    assert rootless
+    assert all(names.valid_label(label) for label in rootless.split("."))
 
 
 def check_host_label(data: bytes) -> None:
@@ -85,6 +108,85 @@ def check_host_label(data: bytes) -> None:
 
 def check_mux_frames(data: bytes) -> None:
     asyncio.run(_check_mux_frames(data))
+
+
+def check_policy_json(data: bytes) -> None:
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return
+
+    try:
+        policy = _parse_static_policy_text(text, path=Path(__file__))
+    except ValueError:
+        return
+
+    _assert_static_policy(policy)
+
+
+def _assert_static_policy(policy: _StaticPolicy) -> None:
+    assert isinstance(policy, _StaticPolicy)
+    assert policy.credentials
+    credential_ids: set[str] = set()
+    token_hashes: set[str] = set()
+    label_owners: dict[str, str] = {}
+    for credential in policy.credentials:
+        _assert_static_credential(credential)
+        assert credential.credential_id not in credential_ids
+        assert credential.token_sha256 not in token_hashes
+        credential_ids.add(credential.credential_id)
+        token_hashes.add(credential.token_sha256)
+        if credential.allowed_label is not None:
+            owner = label_owners.get(credential.allowed_label)
+            assert owner is None or owner == credential.account_id
+            label_owners[credential.allowed_label] = credential.account_id
+    if policy.policy_update is not None:
+        _assert_policy_update(policy.policy_update)
+
+
+def _assert_static_credential(credential: _StaticCredential) -> None:
+    assert isinstance(credential, _StaticCredential)
+    assert credential.credential_id
+    assert credential.account_id
+    assert len(credential.token_sha256) == 64
+    int(credential.token_sha256, 16)
+    assert credential.max_tunnels >= 0
+    if credential.allowed_label is not None:
+        assert credential.allowed_label == credential.allowed_label.lower()
+        assert names.valid_label(credential.allowed_label)
+    for value in (
+        credential.budget.max_visitors,
+        credential.budget.max_bytes_per_sec,
+        credential.budget.max_reconnects_per_min,
+        credential.budget.max_buffered_bytes,
+    ):
+        assert value is None or (
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        )
+    assert credential.lease_seconds is None or credential.lease_seconds > 0
+
+
+def _assert_policy_update(update: PolicyUpdate) -> None:
+    assert isinstance(update, PolicyUpdate)
+    assert isinstance(update.version, int) and not isinstance(update.version, bool)
+    assert update.version > 0
+    seen_revocations: set[str] = set()
+    for lease_id in update.revoke_lease_ids:
+        assert isinstance(lease_id, str) and lease_id
+        assert lease_id not in seen_revocations
+        seen_revocations.add(lease_id)
+    for revocation in update.lease_revocations:
+        assert isinstance(revocation, LeaseRevocation)
+        assert revocation.lease_id
+        assert revocation.action in ("drain", "close")
+        assert revocation.lease_id not in seen_revocations
+        seen_revocations.add(revocation.lease_id)
+    seen_accounts: set[str] = set()
+    for budget_update in update.account_budgets:
+        assert isinstance(budget_update, AccountBudgetUpdate)
+        assert budget_update.account_id
+        assert budget_update.account_id not in seen_accounts
+        seen_accounts.add(budget_update.account_id)
 
 
 async def _check_mux_frames(data: bytes) -> None:
@@ -146,3 +248,4 @@ def run_all_targets_once(data: bytes) -> None:
     check_request_head(data)
     check_host_label(data)
     check_mux_frames(data)
+    check_policy_json(data)

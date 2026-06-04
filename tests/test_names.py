@@ -1,4 +1,4 @@
-"""Tests for subdomain label generation (names.random_phrase / random_label)."""
+"""Tests for subdomain label generation (names.random_phrase)."""
 
 from chute import names
 
@@ -22,7 +22,3 @@ def test_random_phrase_shape():
 def test_random_phrase_varies():
     # ~440k combinations -> 50 draws must not collapse to a single value.
     assert len({names.random_phrase() for _ in range(50)}) > 1
-
-
-def test_random_label_still_valid():
-    assert names.valid_label(names.random_label())

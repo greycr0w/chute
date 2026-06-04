@@ -10,9 +10,13 @@
 Description=chute tunnel server
 After=network-online.target
 Wants=network-online.target
+# Config mistakes should become a visible failed unit, not a forever 2s crash loop.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 User=chute
 Group=chute
 WorkingDirectory=/opt/chute
@@ -20,6 +24,7 @@ EnvironmentFile=/etc/chute/chute.env
 ExecStart=/opt/chute/.venv/bin/chuted run
 Restart=always
 RestartSec=2
+WatchdogSec=30s
 
 # --- resource backstops (contain a DoS to this unit, not the whole VPS) ---
 MemoryMax=512M
@@ -39,11 +44,17 @@ PrivateDevices=true
 ProtectProc=invisible
 ProcSubset=pid
 UMask=0077
+# Optional file-backed EventSink path. systemd creates /var/log/chute owned by
+# the service user; CHUTE_EVENT_LOG_FILE=/var/log/chute/events.jsonl can use it
+# without opening broader write access under ProtectSystem=strict.
+LogsDirectory=chute
+LogsDirectoryMode=0700
 
 # --- privilege / kernel surface (binds only high unprivileged ports) ---
 CapabilityBoundingSet=
 AmbientCapabilities=
-RestrictAddressFamilies=AF_INET AF_INET6
+# AF_UNIX is required for systemd Type=notify / WatchdogSec sd_notify().
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectKernelLogs=true

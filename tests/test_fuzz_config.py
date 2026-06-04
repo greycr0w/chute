@@ -39,7 +39,29 @@ def test_clusterfuzzlite_build_config_exists() -> None:
     assert "COPY . $SRC/chute" in dockerfile
     assert "pyinstaller" in build
     assert "*_fuzzer.py" in build
+    assert "policy_json_fuzzer" not in build  # discovered by the wildcard, not hard-coded
     assert "seed_corpus.zip" in build
+    assert "$fuzzer_basename.dict" in build
+
+    policy_seed_dir = ROOT / "fuzz" / "corpus" / "policy_json"
+    assert (ROOT / "fuzz" / "policy_json_fuzzer.py").exists()
+    assert policy_seed_dir.is_dir()
+    assert {path.name for path in policy_seed_dir.iterdir()} >= {
+        "valid_policy",
+        "policy_update",
+        "duplicate_revocation",
+        "invalid_json",
+    }
+
+
+def test_every_atheris_target_has_seed_corpus_and_dictionary() -> None:
+    from fuzz.run_atheris import FUZZERS
+
+    for target in FUZZERS:
+        assert (ROOT / "fuzz" / "corpus" / target).is_dir(), target
+        dictionary = ROOT / "fuzz" / "dictionaries" / f"{target}.dict"
+        assert dictionary.is_file(), target
+        assert dictionary.read_text().strip(), target
 
 
 def test_clusterfuzzlite_build_script_is_valid_bash() -> None:

@@ -11,6 +11,9 @@ surfaced the finding, hardened into a regression guard.
     F57  WINDOW_UPDATE must be validated (no delta==0 stall-bypass, no overflow)
     F58  a late RESET must not turn an already-clean EOF into an abort
     F59  the connection-level buffer cap bounds aggregate memory
+    F15  a flood past a stream cap must emit one RESET, not one per late frame
+    F42  a late RESET after clean EOF must still stop the stream's send direction
+    F23  local reset closes the send direction before any late producer can write
 """
 
 from __future__ import annotations
@@ -23,7 +26,7 @@ import pytest
 
 import chute.mux
 from chute import protocol
-from chute.mux import Mux, Stream
+from chute.mux import Mux, Stream, _StreamClosed
 
 
 class _FakeWS:
@@ -139,6 +142,51 @@ async def test_tiny_frame_flood_trips_frame_count_cap(monkeypatch) -> None:
     assert s.reset_by_peer is True
 
 
+async def test_stream_overflow_reset_is_not_amplified(monkeypatch) -> None:
+    # Once the first over-window frame marks the stream RESET, later DATA must be
+    # dropped without spawning another RESET send. Otherwise a malicious burst turns
+    # one buffer violation into O(N) control frames.
+    monkeypatch.setattr(chute.mux, "_STREAM_HARD_MAX", 4)
+    ws = _FakeWS()
+    mux = Mux(ws)
+    s = Stream(mux, 1)
+    mux._streams[1] = s
+
+    s._feed(b"aaaa")  # exactly the cap: still allowed
+    for _ in range(20):
+        s._feed(b"x")  # first one violates; the rest must be ignored
+    await asyncio.sleep(0.05)
+
+    resets = [frame for frame in ws.sent if protocol.decode(frame)[0] == protocol.RESET]
+    assert len(resets) == 1
+    assert protocol.decode(resets[0])[1] == 1
+    assert s.reset_by_peer is True
+
+
+async def test_unknown_frame_churn_is_capped_without_stream_or_task_growth(monkeypatch) -> None:
+    monkeypatch.setattr(chute.mux, "_MAX_IGNORED_FRAMES", 6)
+    ws = _ScriptedWS(
+        [
+            protocol.encode(protocol.DATA, 100, b"x"),
+            protocol.encode(protocol.EOF, 101, b""),
+            protocol.encode(protocol.RESET, 102, b""),
+            protocol.encode(protocol.WINDOW_UPDATE, 103, struct.pack("!I", 1)),
+            protocol.encode(protocol.OPEN, 104, b""),
+            protocol.encode(protocol.DATA, 105, b"x"),
+        ]
+    )
+    mux = Mux(ws)
+
+    await asyncio.wait_for(mux.run(), timeout=1)
+
+    assert ws.transport.aborted
+    assert mux.stats()["ignored_frames"] == 6
+    assert mux.stats()["ignored_frame_limit"] == 1
+    assert mux.active_streams == 0
+    assert mux._tasks == set()
+    assert ws.sent == []
+
+
 # -- F57: WINDOW_UPDATE validation --------------------------------------------
 async def test_zero_window_update_is_ignored() -> None:
     # delta==0 must NOT wake the credit waiter -- otherwise a flood of them resets the
@@ -205,6 +253,21 @@ async def test_malformed_window_update_resets_before_later_data() -> None:
         await _quiet_cancel(task)
 
 
+async def test_local_reset_closes_send_direction_before_late_data() -> None:
+    ws = _FakeWS()
+    mux = Mux(ws)
+    s = Stream(mux, 1)
+    mux._streams[1] = s
+
+    await s.reset()
+    with pytest.raises(_StreamClosed):
+        await s.send(b"late-after-reset")
+
+    frames = [protocol.decode(frame) for frame in ws.sent]
+    assert [(ftype, sid) for ftype, sid, _payload in frames] == [(protocol.RESET, 1)]
+    assert 1 not in mux._streams
+
+
 async def test_window_growth_is_capped() -> None:
     s = Stream(Mux(_FakeWS()), 1)
     s._send_window = chute.mux._MAX_SEND_WINDOW
@@ -224,6 +287,31 @@ async def test_reset_after_clean_eof_stays_clean() -> None:
     assert await s.read() == b"body"
     assert await s.read() is None
     assert s.reset_by_peer is False, "a late RESET must not turn a clean EOF into an abort"
+
+
+async def test_late_reset_after_clean_eof_stops_send_direction(monkeypatch) -> None:
+    # F42: preserving a clean receive EOF must not leave the opposite direction
+    # alive. A peer RESET after response EOF still tears down the stream, wakes a
+    # sender parked on credit, and frees the stream slot.
+    monkeypatch.setattr(chute.mux, "_FLOW_WINDOW", 1)
+    mux = Mux(_FakeWS())
+    s = Stream(mux, 1)
+    mux._streams[1] = s
+    await s.send(b"A")
+    blocked_send = asyncio.ensure_future(s.send(b"B"))
+    await asyncio.sleep(0.05)
+    assert not blocked_send.done()
+
+    s._feed_eof()
+    assert await s.read() is None
+    assert s.reset_by_peer is False
+    assert 1 in mux._streams
+
+    s._abort()
+    with pytest.raises(_StreamClosed):
+        await asyncio.wait_for(blocked_send, timeout=1)
+    assert 1 not in mux._streams
+    assert s.reset_by_peer is False
 
 
 async def test_reset_before_eof_is_abort() -> None:

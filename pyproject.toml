@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.27.0"]
 build-backend = "hatchling.build"
 
 [project]
 name = "chute"
-version = "0.3.0"
+version = "0.4.0"
 description = "A tiny, self-hosted, zero-maintenance HTTP tunnel -- your own ngrok."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -35,7 +35,10 @@ dependencies = [
     # keeps prod on the same major the suite + lock run against. (>=16 is also where
     # the websockets asyncio implementation chute relies on is the default.)
     "websockets>=16,<17",
-    "cryptography>=42,<49",
+    # cryptography 42.0.0 through 44.0.0 wheels bundle vulnerable OpenSSL
+    # (GHSA-79v4-65xg-pq4g / CVE-2024-12797); keep the runtime floor at the
+    # first patched release even though the lock currently resolves newer.
+    "cryptography>=44.0.1,<49",
 ]
 
 [project.urls]
@@ -51,6 +54,10 @@ dev = [
     "mypy>=1.13",
     "build>=1.0",
     "hypothesis>=6.0",
+    "cyclonedx-bom==7.3.0",
+    "pip-audit==2.10.0",
+    "pre-commit==4.6.0",
+    "ruff==0.15.15",
 ]
 fuzz = [
     "atheris>=3.0,<4",
@@ -67,13 +74,17 @@ packages = ["src/chute"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 
+[tool.uv]
+# 0.5.26 is the oldest uv version known to generate and consume the current lock/export flow.
+required-version = ">=0.5.26"
+
 [tool.ruff]
 target-version = "py311"
 line-length = 100
 src = ["src", "tests", "fuzz"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "W", "B", "UP"]
+select = ["E", "F", "I", "W", "B", "UP", "RUF006"]
 
 [tool.ruff.lint.per-file-ignores]
 # Tests favor readable long assert strings and intentionally-broad raises.

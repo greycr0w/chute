@@ -7,10 +7,11 @@
 #
 # Override defaults via env, e.g.:
 #   CHUTE_BASE_DOMAIN=chute.sh CHUTE_PUBLIC_PORT=8080 ./deploy/deploy.sh root@host
+#   CHUTE_AGENT_CIDRS="1.2.3.4/32" ./deploy/deploy.sh root@host
 #
 # What it does on the box:
 #   1. rsync this repo to /opt/chute/src   (no .git / venv / caches)
-#   2. build a venv at /opt/chute/.venv and `pip install` the package
+#   2. build a pinned-Python venv at /opt/chute/.venv and install the package
 #   3. ensure the `chute` service user
 #   4. write /etc/chute/chute.env  (token generated once; chmod 600)
 #   5. ensure the control-channel pinned cert (generated once)
@@ -25,10 +26,11 @@ PUBLIC_PORT="${CHUTE_PUBLIC_PORT:-8080}"
 CONTROL_PORT="${CHUTE_CONTROL_PORT:-7000}"
 CERT_ROOT="${CHUTE_CERT_ROOT:-/home/letsencrypt/chute/certs}"
 # Optional: space-separated CIDRs allowed to reach the control port. When set
-# (and ufw is already active on the box) the deploy restricts the port to these;
-# otherwise it just prints the commands. The agent dials OUT, so the control
-# port rarely needs to be open to the whole internet.
+# (and ufw is already active on the box) the deploy restricts the port to these.
+# Without active ufw, set CHUTE_ALLOW_OPEN_CONTROL=1 only if an external firewall
+# or private network already enforces the same restriction.
 AGENT_CIDRS="${CHUTE_AGENT_CIDRS:-}"
+ALLOW_OPEN_CONTROL="${CHUTE_ALLOW_OPEN_CONTROL:-0}"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 
 echo "==> [1/2] syncing source to $REMOTE:/opt/chute/src"
@@ -41,7 +43,7 @@ rsync -az --delete \
 echo "==> [2/2] installing on the box (venv + systemd + nginx)"
 ssh "$REMOTE" \
   BASE_DOMAIN="$BASE_DOMAIN" PUBLIC_PORT="$PUBLIC_PORT" CONTROL_PORT="$CONTROL_PORT" \
-  CERT_ROOT="$CERT_ROOT" AGENT_CIDRS="$AGENT_CIDRS" \
+  CERT_ROOT="$CERT_ROOT" AGENT_CIDRS="$AGENT_CIDRS" ALLOW_OPEN_CONTROL="$ALLOW_OPEN_CONTROL" \
   'bash -s' <<'REMOTE_SCRIPT'
 set -euo pipefail
 : "${BASE_DOMAIN:?}" "${PUBLIC_PORT:?}" "${CONTROL_PORT:?}" "${CERT_ROOT:?}"
@@ -50,20 +52,39 @@ set -euo pipefail
 id -u chute >/dev/null 2>&1 || \
   useradd --system --home-dir /opt/chute --shell /usr/sbin/nologin chute
 
-# 2) venv + install. Runtime deps come from the HASH-PINNED lock export
-# (deploy/requirements.txt, generated from uv.lock) so prod runs the exact versions
-# CI tested -- not whatever pip resolves fresh. chute itself is then installed
-# --no-deps (its runtime deps are already pinned by the line above).
-python3 -m venv /opt/chute/.venv
-/opt/chute/.venv/bin/pip install --quiet --upgrade pip
+# 2) venv + install. Runtime deps and build deps come from HASH-PINNED exports, so
+# prod runs the exact versions CI tested instead of resolving fresh on the box.
+# The interpreter version comes from the repo pin; uv can install it if the OS
+# image doesn't already have that Python minor.
+PYTHON_VERSION="$(tr -d '[:space:]' </opt/chute/src/.python-version)"
+[ -n "$PYTHON_VERSION" ] || { echo "missing /opt/chute/src/.python-version" >&2; exit 1; }
+command -v uv >/dev/null 2>&1 || {
+  echo "uv is required on the VPS to provision pinned Python $PYTHON_VERSION" >&2
+  echo "install uv once, then rerun deploy/deploy.sh" >&2
+  exit 1
+}
+uv python install "$PYTHON_VERSION"
+uv venv --python "$PYTHON_VERSION" /opt/chute/.venv
+# chute itself is then installed without dependency resolution or build isolation.
 /opt/chute/.venv/bin/pip install --quiet --require-hashes -r /opt/chute/src/deploy/requirements.txt
-/opt/chute/.venv/bin/pip install --quiet --no-deps /opt/chute/src
+/opt/chute/.venv/bin/pip install --quiet --require-hashes -r /opt/chute/src/deploy/build-requirements.txt
+/opt/chute/.venv/bin/pip install --quiet --no-build-isolation --no-deps /opt/chute/src
 
 # 3) control-channel pinned cert (generated ONCE; the client pins this exact file)
 if [ ! -f /opt/chute/chute-cert.pem ]; then
   echo "    generating control-channel cert (one time)"
   /opt/chute/.venv/bin/chuted gen-cert --host "$BASE_DOMAIN" \
     --cert /opt/chute/chute-cert.pem --key /opt/chute/chute-key.pem
+fi
+
+PUBLIC_CERT="$CERT_ROOT/$BASE_DOMAIN/fullchain.pem"
+PUBLIC_KEY="$CERT_ROOT/$BASE_DOMAIN/privkey.pem"
+if [ ! -f "$PUBLIC_CERT" ] || [ ! -f "$PUBLIC_KEY" ]; then
+  echo "missing wildcard public TLS cert/key for nginx:" >&2
+  echo "  $PUBLIC_CERT" >&2
+  echo "  $PUBLIC_KEY" >&2
+  echo "Set CHUTE_CERT_ROOT or provision the wildcard cert before running deploy.sh." >&2
+  exit 1
 fi
 
 # 4) candidate env with the shared token preserved, but runtime values regenerated
@@ -89,6 +110,11 @@ EOF
 chmod 600 /etc/chute/chute.env.new
 chown chute:chute /etc/chute/chute.env.new
 chown -R chute:chute /opt/chute /etc/chute
+if id -u chute-deploy >/dev/null 2>&1; then
+  chown -R chute-deploy:chute-deploy /opt/chute/src
+  install -d -m 700 -o chute-deploy -g chute-deploy \
+    /opt/chute/uv /opt/chute/uv/cache /opt/chute/uv/python
+fi
 chgrp -R chute /opt/chute/.venv
 chmod -R g+rwX /opt/chute/.venv
 find /opt/chute/.venv -type d -exec chmod g+s {} +
@@ -131,7 +157,7 @@ sed \
   /opt/chute/src/deploy/nginx-chute.conf > "$NGINX_CONF"
 ln -sf "$NGINX_CONF" "$NGINX_LINK"
 if nginx -t; then
-  rm -f "$NGINX_BACKUP"
+  :
 else
   echo "!!! nginx -t FAILED -- left the running config untouched, fix and re-run" >&2
   _restore_nginx_candidate
@@ -139,7 +165,35 @@ else
   exit 1
 fi
 
-# 6) commit daemon env + systemd unit only after nginx validates, then restart.
+# 6) restrict the pre-auth control port before the daemon is restarted. If this
+# deploy cannot enforce the restriction itself, require an explicit override.
+if [ -n "${AGENT_CIDRS:-}" ]; then
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+    ufw --force delete allow "$CONTROL_PORT"/tcp >/dev/null 2>&1 || true
+    ufw --force delete deny "$CONTROL_PORT"/tcp >/dev/null 2>&1 || true
+    ufw insert 1 deny "$CONTROL_PORT"/tcp >/dev/null
+    for cidr in $AGENT_CIDRS; do
+      ufw insert 1 allow from "$cidr" to any port "$CONTROL_PORT" proto tcp >/dev/null
+    done
+    echo "    restricted control port $CONTROL_PORT/tcp to: $AGENT_CIDRS"
+  elif [ "${ALLOW_OPEN_CONTROL:-0}" != "1" ]; then
+    echo "!!! CHUTE_AGENT_CIDRS is set but ufw is not active; restrict $CONTROL_PORT/tcp yourself or set CHUTE_ALLOW_OPEN_CONTROL=1 to acknowledge an external firewall" >&2
+    _restore_nginx_candidate
+    rm -f /etc/chute/chute.env.new
+    exit 1
+  else
+    echo "    NOTE: ufw not active -- relying on your external firewall for $CONTROL_PORT/tcp"
+  fi
+elif [ "${ALLOW_OPEN_CONTROL:-0}" != "1" ]; then
+  echo "!!! CHUTE_AGENT_CIDRS is empty. Refusing to expose control port $CONTROL_PORT/tcp without an allowlist." >&2
+  echo "    Set CHUTE_AGENT_CIDRS=\"1.2.3.4/32\" or CHUTE_ALLOW_OPEN_CONTROL=1 if an external firewall already restricts it." >&2
+  _restore_nginx_candidate
+  rm -f /etc/chute/chute.env.new
+  exit 1
+fi
+rm -f "$NGINX_BACKUP"
+
+# 7) commit daemon env + systemd unit only after nginx validates, then restart.
 mv /etc/chute/chute.env.new /etc/chute/chute.env
 chmod 600 /etc/chute/chute.env
 chown chute:chute /etc/chute/chute.env
@@ -148,24 +202,8 @@ install -m 0755 -o root -g root /opt/chute/src/deploy/deploy-pull.sh /usr/local/
 systemctl daemon-reload
 systemctl enable chuted >/dev/null 2>&1 || true
 systemctl restart chuted
+systemctl is-active --quiet chuted
 systemctl reload nginx
-
-# 7) optionally restrict the pre-auth control port to known agent source IP(s)
-if [ -n "${AGENT_CIDRS:-}" ]; then
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
-    for cidr in $AGENT_CIDRS; do
-      ufw allow from "$cidr" to any port "$CONTROL_PORT" proto tcp >/dev/null
-    done
-    ufw deny "$CONTROL_PORT"/tcp >/dev/null || true
-    echo "    restricted control port $CONTROL_PORT/tcp to: $AGENT_CIDRS"
-  else
-    echo "    NOTE: ufw not active -- restrict $CONTROL_PORT/tcp yourself, e.g.:"
-    for cidr in $AGENT_CIDRS; do
-      echo "      ufw allow from $cidr to any port $CONTROL_PORT proto tcp"
-    done
-    echo "      ufw deny $CONTROL_PORT/tcp"
-  fi
-fi
 
 TOKEN="$(grep '^CHUTE_TOKEN=' /etc/chute/chute.env | cut -d= -f2-)"
 echo
@@ -173,7 +211,7 @@ echo "===================== chute deployed ====================="
 echo "  base domain : *.$BASE_DOMAIN"
 echo "  control     : wss://$BASE_DOMAIN:$CONTROL_PORT"
 echo "                RESTRICT $CONTROL_PORT/tcp to your agent's source IP(s) -- it must NOT be open to 0.0.0.0/0."
-echo "                (set CHUTE_AGENT_CIDRS=\"1.2.3.4/32\" to have this script do it via ufw, or front it with WireGuard/Tailscale.)"
+echo "                (set CHUTE_AGENT_CIDRS=\"1.2.3.4/32\" for ufw, or CHUTE_ALLOW_OPEN_CONTROL=1 when an external firewall already enforces this.)"
 echo "  token       : $TOKEN"
 echo "  client cert : /opt/chute/chute-cert.pem"
 echo "==========================================================="
@@ -184,6 +222,10 @@ echo
 echo "==> pull the pinned client cert down to your Mac:"
 echo "    scp $REMOTE:/opt/chute/chute-cert.pem ./chute-cert.pem"
 echo
+echo "==> save the token locally for --token-file:"
+echo "    install -d -m 700 ~/.config/chute"
+echo "    printf '%s\\n' '<token-above>' > ~/.config/chute/token && chmod 600 ~/.config/chute/token"
+echo
 echo "==> then start a tunnel:"
-echo "    chute http 8000 --server $BASE_DOMAIN --control-port $CONTROL_PORT \\"
-echo "      --token <token-above> --server-cert ./chute-cert.pem --subdomain myapp"
+echo "    chute 8000 --server $BASE_DOMAIN --control-port $CONTROL_PORT \\"
+echo "      --token-file ~/.config/chute/token --server-cert ./chute-cert.pem --subdomain myapp"

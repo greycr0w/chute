@@ -31,6 +31,10 @@ def test_port_is_stripped() -> None:
     assert _host_from_head(_head("GET / HTTP/1.1", "Host: alpha.chute.sh:8443")) == "alpha.chute.sh"
 
 
+def test_bracketed_ipv6_literal_is_accepted_and_port_stripped() -> None:
+    assert _host_from_head(_head("GET / HTTP/1.1", "Host: [::1]:8443")) == "[::1]"
+
+
 def test_max_valid_port_is_stripped() -> None:
     # A well-formed port (1-5 digits, <=65535) is stripped; only a malformed one is 400.
     assert _host_from_head(_head("GET / HTTP/1.1", "Host: a.chute.sh:65535")) == "a.chute.sh"
@@ -97,6 +101,17 @@ def test_default_route_rejects_http11_without_host() -> None:
         (("GET / HTTP/1.1", "Host: a.chute.sh:"), "empty port"),
         (("GET / HTTP/1.1", "Host: a.chute.sh:-1"), "negative port"),
         (("GET / HTTP/1.1", "Host: a.chute.sh:999999999999"), "out-of-range port"),
+        (("GET / HTTP/1.1", "Host: 2001:db8::1"), "unbracketed IPv6 literal"),
+        (("GET / HTTP/1.1", "Host: a.chute.sh:443:444"), "multiple unbracketed colons"),
+        (("GET / HTTP/1.1", "Host: a.chute.sh::443"), "empty colon component"),
+        (("GET / HTTP/1.1", "Host: :80"), "empty host with port"),
+        (("GET / HTTP/1.1", "Host: ::1"), "colon-only host"),
+        (("GET / HTTP/1.1", "Host: user@a.chute.sh"), "userinfo marker is not Host"),
+        (("GET / HTTP/1.1", "Host: a..chute.sh"), "empty DNS label"),
+        (("GET / HTTP/1.1", "Host: .chute.sh"), "leading empty DNS label"),
+        (("GET / HTTP/1.1", "Host: a-.chute.sh"), "label ending with hyphen"),
+        (("GET / HTTP/1.1", "Host: [not-ip]"), "malformed bracketed literal"),
+        (("GET / HTTP/1.1", "Host: []"), "empty bracketed literal"),
     ],
 )
 def test_rejected(lines: tuple[str, ...], why: str) -> None:

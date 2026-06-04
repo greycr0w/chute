@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "credentials": [
+    {
+      "credential_id": "cred-a",
+      "token_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "account_id": "acct-a"
+    }
+  ],
+  "policy_version": 1,
+  "revoke_lease_ids": ["same-lease"],
+  "lease_revocations": [
+    {"lease_id": "same-lease", "action": "close"}
+  ]
+}

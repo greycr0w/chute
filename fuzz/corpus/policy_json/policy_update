@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "credentials": [
+    {
+      "credential_id": "cred-a",
+      "token_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "account_id": "acct-a"
+    }
+  ],
+  "policy_version": 7,
+  "revoke_lease_ids": ["lease-drain"],
+  "lease_revocations": [
+    {"lease_id": "lease-close", "action": "close"}
+  ],
+  "account_budgets": [
+    {"account_id": "acct-a", "budget": {"max_visitors": 0}}
+  ]
+}

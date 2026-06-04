@@ -8,8 +8,9 @@ with no database, while an alternative authorizer -- for example a database-back
 one that maps tokens to accounts -- can be injected at runtime via the
 ``CHUTE_AUTHORIZER`` env knob without changing the relay.
 
-``authenticate`` is ``async`` because a database-backed authorizer does I/O
-(e.g. asyncpg); the static one just returns a constant.
+``authenticate`` receives a structured :class:`AuthRequest` so the seam can grow
+without adding positional arguments. It is ``async`` because a database-backed
+authorizer does I/O (e.g. asyncpg); the static one just returns a constant.
 """
 
 from __future__ import annotations
@@ -18,7 +19,14 @@ import hmac
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
-__all__ = ["UNLIMITED_TUNNELS", "AuthResult", "Authorizer", "Budget", "StaticTokenAuthorizer"]
+__all__ = [
+    "UNLIMITED_TUNNELS",
+    "AuthRequest",
+    "AuthResult",
+    "Authorizer",
+    "Budget",
+    "StaticTokenAuthorizer",
+]
 
 # The single-tenant default: no per-account tunnel cap. Large but finite so callers
 # can compare/relational-test it without special-casing math.inf. An alternative
@@ -38,22 +46,38 @@ class Budget:
 
     ENFORCED today (the relay checks these):
 
-    - ``max_visitors`` -- max concurrent visitor streams summed across all of the
-      account's live tunnels. Admission past it is refused (503).
-
-    RESERVED -- an authorizer MAY set these and a future relay will honour them, but
-    they are **not enforced yet**; do not rely on them as a control:
-
-    - ``max_bytes_per_sec``      -- aggregate relayed bandwidth per account.
-    - ``max_reconnects_per_min`` -- control-channel reconnect rate per account.
-    - ``max_buffered_bytes``     -- aggregate in-flight memory per account (today
-      bounded only indirectly by ``max_tunnels`` × the per-connection memory cap).
+    - ``max_visitors`` -- max concurrent visitor streams reserved across all of the
+      account's tunnels. Admission past it is refused (503).
+    - ``max_reconnects_per_min`` -- max successful control-channel connects per
+      account per relay per minute. Admission past it is refused with retryable
+      close `1013`.
+    - ``max_bytes_per_sec`` -- aggregate relayed bytes per account per relay. Both
+      relay directions share the same local limiter; chunks are delayed before
+      forwarding. Zero or malformed limits fail closed.
+    - ``max_buffered_bytes`` -- aggregate unread mux payload bytes per account per
+      relay. This caps memory chute directly owns in stream queues; kernel socket
+      buffers and downstream application memory remain outside the relay budget.
     """
 
     max_visitors: int | None = None  # ENFORCED
-    max_bytes_per_sec: int | None = None  # reserved (not yet enforced)
-    max_reconnects_per_min: int | None = None  # reserved (not yet enforced)
-    max_buffered_bytes: int | None = None  # reserved (not yet enforced)
+    max_bytes_per_sec: int | None = None  # ENFORCED per relay
+    max_reconnects_per_min: int | None = None  # ENFORCED per relay
+    max_buffered_bytes: int | None = None  # ENFORCED per relay
+
+
+@dataclass(frozen=True, slots=True)
+class AuthRequest:
+    """Structured authorization request handed to an :class:`Authorizer`.
+
+    This is chute's open-core policy boundary: the relay supplies transport facts it
+    knows, while the authorizer decides account/business policy outside the relay.
+    """
+
+    token: str
+    requested_subdomain: str | None
+    agent_ip: str | None
+    scheme: str
+    protocol_version: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,12 +93,15 @@ class AuthResult:
       or ``None`` for no special grant.
     - ``budget`` -- per-account resource :class:`Budget` (default: unlimited). The
       relay enforces the transport-level fields it can; see :class:`Budget`.
+    - ``credential_id`` -- optional opaque id of the credential that authenticated.
+      chute never interprets it; event sinks use it to persist lifecycle history.
     """
 
     account_id: str
     max_tunnels: int = UNLIMITED_TUNNELS
     allowed_label: str | None = None
     budget: Budget = field(default_factory=Budget)
+    credential_id: str | None = None
 
 
 @runtime_checkable
@@ -84,25 +111,24 @@ class Authorizer(Protocol):
     relay holds any lock -- it deliberately authorizes outside its pre-auth semaphore.
     """
 
-    async def authenticate(
-        self, token: str, requested_subdomain: str | None, agent_ip: str | None
-    ) -> AuthResult | None: ...
+    async def authenticate(self, request: AuthRequest) -> AuthResult | None: ...
 
 
 class StaticTokenAuthorizer:
-    """The default: one shared secret gates one effectively-unbounded tenant.
+    """The default: one shared secret gates one bootstrap tenant.
 
     This is exactly chute's original behavior -- a constant-time compare against the
     configured token -- repackaged behind the :class:`Authorizer` seam so the relay
-    has a single code path. No accounts, no database, no per-account limits.
+    has a single code path. No accounts, no database, no per-account policy; relay-
+    local host limits such as ``max_agents`` still apply.
     """
 
     def __init__(self, token: str) -> None:
+        if not token:
+            raise ValueError("static token must not be empty")
         self._token = token
 
-    async def authenticate(
-        self, token: str, requested_subdomain: str | None, agent_ip: str | None
-    ) -> AuthResult | None:
+    async def authenticate(self, request: AuthRequest) -> AuthResult | None:
         # Constant-time compare, identical to the inline check the server used
         # before. requested_subdomain/agent_ip are irrelevant to a single shared
         # token; the relay still does its own label assignment downstream.
@@ -110,6 +136,6 @@ class StaticTokenAuthorizer:
         # str, and the server's blanket except would mistake that crash for
         # "authorizer unavailable" (retryable 1013) -- bypassing the failed-auth
         # limiter on any Unicode token. encode() makes a bad token a clean reject.
-        if hmac.compare_digest(str(token).encode(), self._token.encode()):
+        if hmac.compare_digest(request.token.encode(), self._token.encode()):
             return AuthResult(account_id="0")
         return None

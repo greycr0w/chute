@@ -27,5 +27,50 @@ def test_mux_frame_fuzz_target_contract() -> None:
     _targets.check_mux_frames(b"open-data-eof-reset-goaway-window" * 4)
 
 
+def test_policy_json_fuzz_target_contract() -> None:
+    _targets.check_policy_json(
+        b"""
+        {
+          "schema_version": 1,
+          "credentials": [
+            {
+              "credential_id": "cred-a",
+              "token_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "account_id": "acct-a",
+              "allowed_label": "dev",
+              "budget": {"max_visitors": 1},
+              "lease_seconds": 30
+            }
+          ]
+        }
+        """
+    )
+    _targets.check_policy_json(
+        b"""
+        {
+          "schema_version": 1,
+          "credentials": [
+            {
+              "credential_id": "cred-a",
+              "token_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "account_id": "acct-a"
+            }
+          ],
+          "policy_version": 1,
+          "revoke_lease_ids": ["same"],
+          "lease_revocations": [{"lease_id": "same", "action": "close"}]
+        }
+        """
+    )
+    _targets.check_policy_json(b"\xff")
+    _targets.check_policy_json(b"{not json")
+
+
 def test_all_atheris_targets_are_registered() -> None:
-    assert set(FUZZERS) == {"host_label", "mux_frames", "protocol_decode", "request_head"}
+    assert set(FUZZERS) == {
+        "host_label",
+        "mux_frames",
+        "policy_json",
+        "protocol_decode",
+        "request_head",
+    }

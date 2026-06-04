@@ -4,7 +4,7 @@ We deliberately do *not* use Let's Encrypt / a public CA for the agent<->server
 control link. We control both ends, so we mint one long-lived self-signed
 certificate on the server and pin it in the client. Benefits:
 
-* zero renewal maintenance (10-year validity -> effectively fire-and-forget),
+* no ACME renewal loop (10-year validity plus a startup expiry warning),
 * no certbot, no ACME, no port-80 challenge dance,
 * MITM protection is *stronger* than public CA TLS because the client trusts
   exactly one certificate, not every CA on earth.
@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import datetime as _dt
 import ipaddress
+import logging
+import math
 import os
 import ssl
 from pathlib import Path
@@ -27,6 +29,10 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+log = logging.getLogger(__name__)
+
+_CONTROL_CERT_EXPIRY_WARNING_DAYS = 90
 
 
 def generate(host: str, cert_path: Path, key_path: Path, *, days: int = 3650) -> None:
@@ -82,6 +88,56 @@ def generate(host: str, cert_path: Path, key_path: Path, *, days: int = 3650) ->
         fh.write(key_pem)
 
 
+def certificate_expires_at(cert_path: Path) -> _dt.datetime:
+    """Return the PEM certificate's notAfter value as an aware UTC datetime."""
+    cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+    try:
+        return cert.not_valid_after_utc
+    except AttributeError:  # cryptography < 42 compatibility
+        return cert.not_valid_after.replace(tzinfo=_dt.UTC)
+
+
+def warn_if_control_cert_expiring(
+    cert_path: Path,
+    *,
+    now: _dt.datetime | None = None,
+    warning_days: int = _CONTROL_CERT_EXPIRY_WARNING_DAYS,
+    logger: logging.Logger = log,
+) -> None:
+    """Warn before the manually pinned control certificate becomes an outage."""
+    if warning_days < 0:
+        raise ValueError("warning_days must be non-negative")
+    observed_at = now or _dt.datetime.now(_dt.UTC)
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    observed_at = observed_at.astimezone(_dt.UTC)
+    expires_at = certificate_expires_at(cert_path)
+    remaining = expires_at - observed_at
+    if remaining > _dt.timedelta(days=warning_days):
+        return
+
+    timestamp = expires_at.isoformat(timespec="seconds")
+    if remaining <= _dt.timedelta(0):
+        overdue_days = math.ceil(abs(remaining.total_seconds()) / 86_400)
+        logger.warning(
+            "control certificate %s expired %s day(s) ago at %s; regenerate it and "
+            "redistribute the new --server-cert pin to every agent",
+            cert_path,
+            overdue_days,
+            timestamp,
+        )
+        return
+
+    remaining_days = math.ceil(remaining.total_seconds() / 86_400)
+    logger.warning(
+        "control certificate %s expires in %s day(s) at %s; rotate it before expiry "
+        "and redistribute the new --server-cert pin to every agent",
+        cert_path,
+        remaining_days,
+        timestamp,
+    )
+
+
 def server_ssl_context(cert_path: Path, key_path: Path) -> ssl.SSLContext:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
@@ -92,12 +148,22 @@ def server_ssl_context(cert_path: Path, key_path: Path) -> ssl.SSLContext:
     # long-lived connection (no resumption value) and the edge-TLS path should
     # match the documented nginx posture (`ssl_session_tickets off`) -- pure upside.
     ctx.options |= ssl.OP_NO_TICKET
+    # chute never renegotiates. Disable TLS 1.2 renegotiation where OpenSSL exposes
+    # the switch; TLS 1.3 removed renegotiation from the protocol.
+    if hasattr(ssl, "OP_NO_RENEGOTIATION"):
+        ctx.options |= ssl.OP_NO_RENEGOTIATION
     ctx.num_tickets = 0  # TLS 1.3: issue zero session tickets
     return ctx
 
 
 def client_ssl_context(cert_path: Path) -> ssl.SSLContext:
-    """Trust exactly the pinned server cert; skip hostname checks (self-signed)."""
+    """Trust exactly the pinned server certificate.
+
+    ``load_verify_locations(cafile=cert_path)`` makes the PEM file the trust anchor,
+    ``CERT_REQUIRED`` makes verification mandatory, and ``check_hostname=False`` is
+    intentional: identity is the pinned certificate itself, not a DNS name inside it.
+    A different leaf with the same key still fails because it is not the pinned cert.
+    """
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.load_verify_locations(cafile=str(cert_path))
     ctx.check_hostname = False  # we pin the cert itself, not its hostname

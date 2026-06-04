@@ -24,7 +24,8 @@ import websockets
 
 from chute import certs, protocol
 from chute.client import Tunnel, _FatalError
-from chute.server import Server
+from chute.mux import _FLOW_WINDOW
+from chute.server import Server, _LabelError
 
 
 def _free_port() -> int:
@@ -72,14 +73,18 @@ def _https_get(port: int, path: str, ca_cert: Path) -> tuple[int, bytes]:
         conn.close()
 
 
-def _peer_cert_der(port: int) -> bytes:
+def _peer_cert_der(port: int, *, server_hostname: str | None = "127.0.0.1") -> bytes:
     """TLS-handshake against the edge and return the server cert (DER), unverified."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
-        with ctx.wrap_socket(sock, server_hostname="127.0.0.1") as ssock:
+        with ctx.wrap_socket(sock, server_hostname=server_hostname) as ssock:
             return ssock.getpeercert(binary_form=True)
+
+
+def _pem_cert_der(path: Path) -> bytes:
+    return ssl.PEM_cert_to_DER_cert(path.read_text())
 
 
 @contextlib.asynccontextmanager
@@ -141,6 +146,38 @@ def test_explicit_http_normalizes_single_tunnel_url_scheme() -> None:
     assert server._public_url_for("default", "http") == "http://example.test/"
 
 
+def test_default_route_upstream_tls_rewrites_public_url_to_https() -> None:
+    server = Server(
+        token="secret",
+        public_url="http://example.test/",
+        upstream_tls=True,
+    )
+
+    assert server._public_url_for("default", "https") == "https://example.test/"
+
+
+def test_default_route_explicit_https_url_wins_over_upstream_tls_rewrite() -> None:
+    server = Server(
+        token="secret",
+        public_url="http://example.test:8080/",
+        public_https_url="https://example.test/",
+        upstream_tls=True,
+    )
+
+    assert server._public_url_for("default", "https") == "https://example.test/"
+
+
+def test_host_routed_https_without_tls_fails_closed() -> None:
+    server = Server(
+        token="secret",
+        public_host="127.0.0.1",
+        base_domain="example.test",
+    )
+
+    with pytest.raises(_LabelError, match="https_unavailable"):
+        server._public_url_for("app", "https")
+
+
 async def test_https_requested_without_cert_fails_closed(tmp_path: Path) -> None:
     cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
     certs.generate("127.0.0.1", cert, key)
@@ -175,8 +212,8 @@ async def test_https_requested_without_cert_fails_closed(tmp_path: Path) -> None
 
 
 async def test_agent_without_scheme_gets_http(tmp_path: Path) -> None:
-    # The "scheme" field is optional (defaults to http); a v2 agent that omits it
-    # still gets a working http URL.
+    # The "scheme" field is optional (defaults to http); a current-protocol agent
+    # that omits it still gets a working http URL.
     cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
     certs.generate("127.0.0.1", cert, key)
     http_port, tls_port, control_port = _free_port(), _free_port(), _free_port()
@@ -204,13 +241,14 @@ async def test_agent_without_scheme_gets_http(tmp_path: Path) -> None:
             reply = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
             assert reply["type"] == "ready"
             assert reply["public_url"].startswith("http://")
+            assert reply["flow_window"] == _FLOW_WINDOW
             assert reply["v"] == protocol.VERSION
     finally:
         await _quiet_cancel(server_task)
 
 
-async def test_pre_v2_agent_is_rejected(tmp_path: Path) -> None:
-    # F27: an agent that doesn't advertise the flow-control protocol version is
+async def test_versionless_agent_is_rejected(tmp_path: Path) -> None:
+    # F27: an agent that doesn't advertise the negotiated protocol version is
     # refused with a clear, fatal reason -- not silently served into a stall.
     cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
     certs.generate("127.0.0.1", cert, key)
@@ -344,6 +382,47 @@ async def test_public_cert_hot_reload(tmp_path: Path) -> None:
         certs.generate("127.0.0.1", cert, key)
         await asyncio.sleep(1.2)  # let the watcher pick up the mtime change
         der_after = await asyncio.to_thread(_peer_cert_der, tls_port)
+        der_after_no_sni = await asyncio.to_thread(_peer_cert_der, tls_port, server_hostname=None)
         assert der_before != der_after, "server did not hot-reload the new cert"
+        assert der_after_no_sni == der_after, "no-SNI clients should use the active cert too"
+    finally:
+        await _quiet_cancel(server_task)
+
+
+async def test_public_cert_hot_reload_rejects_torn_pair_without_breaking_listener(
+    tmp_path: Path,
+) -> None:
+    cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
+    certs.generate("127.0.0.1", cert, key)
+    replacement_cert, replacement_key = tmp_path / "new-c.pem", tmp_path / "new-k.pem"
+    certs.generate("127.0.0.1", replacement_cert, replacement_key)
+    http_port, tls_port, control_port = _free_port(), _free_port(), _free_port()
+    server = Server(
+        token="secret",
+        public_host="127.0.0.1",
+        public_port=http_port,
+        control_host="127.0.0.1",
+        control_port=control_port,
+        ssl_context=certs.server_ssl_context(cert, key),
+        tls_cert=cert,
+        tls_key=key,
+        public_tls_port=tls_port,
+        public_https_url=f"https://127.0.0.1:{tls_port}/",
+        cert_reload_interval=0.3,
+    )
+    server_task = asyncio.ensure_future(server.serve())
+    await asyncio.sleep(0.3)
+    try:
+        der_before = await asyncio.to_thread(_peer_cert_der, tls_port)
+        cert.write_bytes(replacement_cert.read_bytes())  # new cert, old key: mismatched pair
+        await asyncio.sleep(1.0)
+        der_while_torn = await asyncio.to_thread(_peer_cert_der, tls_port)
+        assert der_while_torn == der_before
+
+        key.write_bytes(replacement_key.read_bytes())
+        key.chmod(0o600)
+        await asyncio.sleep(1.0)
+        der_after = await asyncio.to_thread(_peer_cert_der, tls_port)
+        assert der_after == _pem_cert_der(replacement_cert)
     finally:
         await _quiet_cancel(server_task)

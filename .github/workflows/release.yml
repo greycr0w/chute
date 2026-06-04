@@ -21,12 +21,26 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - name: Install locked release tooling
+        run: uv sync --locked --extra dev
       - name: Build wheel + sdist
         run: uv build
+      - name: Generate runtime SBOM
+        run: scripts/generate_release_sbom.sh
       - name: Attest build provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
-          subject-path: dist/*
+          subject-path: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/chute-runtime-sbom.cdx.json
+      - name: Attest runtime SBOM
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-path: |
+            dist/*.whl
+            dist/*.tar.gz
+          sbom-path: dist/chute-runtime-sbom.cdx.json
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:

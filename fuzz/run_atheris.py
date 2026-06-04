@@ -13,6 +13,7 @@ FUZZERS = {
     "request_head": "fuzz.request_head_fuzzer",
     "host_label": "fuzz.host_label_fuzzer",
     "mux_frames": "fuzz.mux_frames_fuzzer",
+    "policy_json": "fuzz.policy_json_fuzzer",
 }
 
 
@@ -41,6 +42,9 @@ def main() -> int:
                 str(corpus_dir),
                 f"-atheris_runs={args.runs}",
             ]
+            dictionary = ROOT / "fuzz" / "dictionaries" / f"{target}.dict"
+            if dictionary.exists():
+                cmd.append(f"-dict={dictionary}")
             subprocess.run(cmd, cwd=ROOT, check=True)
     return 0
 

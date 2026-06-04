@@ -1,6 +1,6 @@
-# Keep dependencies and SHA-pinned actions current. Dependabot bumps a pinned action
-# to the latest commit for its major and refreshes the trailing "# vX" comment, and
-# flags vulnerable Python dependencies against the lock.
+# Keep dependencies, SHA-pinned actions, and frozen pre-commit hooks current.
+# Dependabot refreshes trailing version comments for SHA pins and flags vulnerable
+# Python dependencies against the lock.
 version: 2
 updates:
   - package-ecosystem: "github-actions"
@@ -10,6 +10,12 @@ updates:
     commit-message:
       prefix: "ci"
   - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "deps"
+  - package-ecosystem: "pre-commit"
     directory: "/"
     schedule:
       interval: "weekly"

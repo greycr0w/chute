@@ -54,6 +54,23 @@ class _FailingSendWS(_FakeWS):
         raise OSError("transport down")
 
 
+class _AbortableTransport:
+    def __init__(self) -> None:
+        self.aborted = False
+
+    def abort(self) -> None:
+        self.aborted = True
+
+
+class _HangingCloseWS(_FakeWS):
+    def __init__(self) -> None:
+        super().__init__()
+        self.transport = _AbortableTransport()
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        await asyncio.Event().wait()
+
+
 def _frame_types(ws: _FakeWS) -> list[int]:
     return [protocol.decode(f)[0] for f in ws.sent]
 
@@ -217,6 +234,17 @@ async def test_drain_closes_immediately_when_idle() -> None:
     await mux.drain(timeout=5)
     assert ws.closed is not None and ws.closed[0] == 1001  # going-away close
     assert protocol.GOAWAY in _frame_types(ws)
+
+
+async def test_drain_close_timeout_aborts_transport(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("chute.mux._CLOSE_TIMEOUT", 0.01)
+    ws = _HangingCloseWS()
+    mux = Mux(ws)
+
+    await asyncio.wait_for(mux.drain(timeout=0), timeout=1)
+
+    assert ws.transport.aborted
+    assert mux.stats()["close_stall"] == 1
 
 
 async def test_drain_waits_for_inflight_then_closes() -> None:

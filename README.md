@@ -38,9 +38,10 @@ state machine, flow control, teardown, the limits each end enforces against a
 misbehaving peer, and the close codes.
 
 The protocol is **versioned and negotiated in the handshake**; the current version is
-**3** (credit-window flow control + `GOAWAY` graceful drain). Server and agent must be
-upgraded **together** — a version mismatch fails fast with a clear "upgrade" close
-rather than silently stalling, and v3 is not interoperable with older builds.
+**4** (credit-window flow control, `GOAWAY` graceful drain, and negotiated mux flow
+window). Server and agent must be upgraded **together** — a version mismatch fails
+fast with a clear "upgrade" close rather than silently stalling, and v4 is not
+interoperable with older builds.
 
 ## Staying HTTP (the whole point)
 
@@ -106,9 +107,26 @@ chuted run --token "$CHUTE_TOKEN" --domain app.example.com \
 ```
 
 The `--tls-cert/--tls-key` files are watched; when the ACME timer renews them,
-chute swaps the cert for new connections on its own. If HTTPS cannot be
-truthfully advertised, an agent that asks for `https` fails closed with
-`https_unavailable`; pass `http` explicitly when you want plaintext.
+chute swaps the cert for new connections on its own. Set both files or neither:
+an explicit public-TLS config with one missing, unreadable, or invalid file is a
+startup error, not a silent downgrade. If HTTPS cannot be truthfully advertised,
+an agent that asks for `https` fails closed with `https_unavailable`; pass
+`http` explicitly when you want plaintext.
+
+Publish renewed public cert files with an atomic rename in the same directory:
+write each new PEM to a temporary path, then rename it over the watched
+`--tls-cert` / `--tls-key` path. Do not truncate and rewrite the live paths in
+place. chute validates the cert/key pair before switching new handshakes, so a
+torn write keeps serving the last-good pair, but an in-place partial write turns
+renewal into avoidable reload churn.
+
+The built-in public TLS listener is HTTP/1.1-only and does not advertise ALPN.
+For browser HTTP/2, run nginx in front; nginx owns ALPN and the browser-trusted
+ACME certificate, then proxies one plain HTTP/1.1 request per connection into
+chute. Do not add OCSP Must-Staple to the pinned control certificate: it is a
+self-signed leaf with no OCSP responder, and pinning is the revocation model for
+that channel. OCSP stapling is an optional policy for the external ACME cert at
+nginx, not for chute's pinned control leaf.
 
 ## Install
 
@@ -134,10 +152,12 @@ pip install dist/chute-*.whl
 pip install -e ".[dev]"
 ```
 
-No PyPI required (it's a third party you're avoiding): build the wheel and
-install it straight, or `pip install git+ssh://…` from your own repo. The VPS
-side is handled for you by `deploy/deploy.sh` (see below) — it builds an
-isolated venv at `/opt/chute` and installs the package there.
+No PyPI required for the chute package itself (it's a third party you're
+avoiding): build the wheel and install it straight, or `pip install
+git+ssh://…` from your own repo. The VPS side is handled for you by
+`deploy/deploy.sh` (see below) — it uses `uv` on the VPS to provision the
+repo-pinned Python from `.python-version`, builds an isolated venv at
+`/opt/chute`, and installs the hash-pinned runtime deps there.
 
 ## Quick start
 
@@ -228,25 +248,91 @@ pytest                      # unit + loopback E2E (no VPS needed)
 One command from your Mac sets up (or updates) the whole server — venv, systemd
 service, nginx wildcard vhost, a generated token and control cert:
 
+Prereqs on the VPS: install `uv` once and make sure the deploy user can run it,
+and provision the wildcard public TLS cert/key that nginx will serve at
+`$CHUTE_CERT_ROOT/<base-domain>/fullchain.pem` and
+`$CHUTE_CERT_ROOT/<base-domain>/privkey.pem`. The deploy scripts use
+`uv python install` + `uv venv` so production runs the same default Python minor pinned in `.python-version`,
+not the box's ambient `python3`.
+
 ```bash
-./deploy/deploy.sh root@your-vps
+CHUTE_AGENT_CIDRS="1.2.3.4/32" ./deploy/deploy.sh root@your-vps
 ```
 
 It's idempotent: re-run it to ship new code (the token and cert are generated
 once and preserved). It prints the token + the path to the pinned client cert to
-copy down, and reminds you to open the control port in the firewall. nginx owns
-`:80`/`:443` for `*.<base-domain>` and proxies plain HTTP to chute on
+copy down. The control port fails closed unless `CHUTE_AGENT_CIDRS` lets the
+script restrict it through active UFW, or you set `CHUTE_ALLOW_OPEN_CONTROL=1`
+to acknowledge that an external firewall or private network already does. nginx
+owns `:80`/`:443` for `*.<base-domain>` and proxies plain HTTP to chute on
 `127.0.0.1:8080`, so the daemon needs no root and no privileged ports.
 
 Under the hood it installs:
 
-- `deploy/chuted.service` — systemd, `Restart=always`, config from
-  `/etc/chute/chute.env`.
+- `deploy/chuted.service` — systemd `Type=notify` with a watchdog heartbeat,
+  `Restart=always` with a bounded start-rate limit, config from
+  `/etc/chute/chute.env`, and a private `/var/log/chute` directory for the
+  optional `CHUTE_EVENT_LOG_FILE=/var/log/chute/events.jsonl` JSONL sink.
 - `deploy/nginx-chute.conf` — the `*.<base-domain>` vhost (TLS + HTTP, no
   forced upgrade).
 
+The server's local backstops are tunable without editing source:
+`CHUTE_MAX_CONTROL_CONNS`, `CHUTE_MAX_AUTH_CONNS`, `CHUTE_MAX_VISITORS`,
+`CHUTE_MAX_AGENTS`, `CHUTE_MAX_VISITORS_PER_IP`, `CHUTE_HELLO_TIMEOUT`,
+`CHUTE_AUTH_TIMEOUT`, `CHUTE_RELAY_IDLE_TIMEOUT`, and `CHUTE_MUX_FLOW_WINDOW`.
+The mux flow window is negotiated per control connection as the lower of the
+agent and server preferences, so raising it for high-RTT bulk transfer requires
+setting it on both ends. The default is 256 KiB and the configured maximum is
+16 MiB. Use `scripts/benchmark_flow_window.py` to measure RTT/body-size profiles
+before changing the default; the script isolates mux credit behavior and reports
+the bandwidth-delay-product comparison for a target link. See
+[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for the current mux-only and loopback
+end-to-end benchmark notes plus `scripts/benchmark_remote_e2e.py` for real
+VPS/nginx/TLS measurement with a saved `--output-json` report.
+
+Set `CHUTE_METRICS_PORT=<port>` to enable a loopback-only health/metrics listener
+(`CHUTE_METRICS_HOST` defaults to `127.0.0.1`). It serves `/healthz` and
+Prometheus text at `/metrics`, exporting aggregate relay counters, fixed
+generated event counters, control/auth/visitor pool usage/capacity plus busy/limit
+shed counters, control-plane policy applied/rejected counters, lease renewal and
+retirement outcome counters, and event-sink queue health only: no account ids,
+labels, Hosts, request paths, headers, or payload bytes. A routable metrics host
+is a startup error. The same aggregate snapshot is periodically logged even when
+the metrics listener and event sink are disabled.
+
+The optional GitHub Actions CD path in [`deploy/CD-SETUP.md`](deploy/CD-SETUP.md)
+uses a root-installed forced-command runner and signed commit verification by
+default. Configure `/etc/chute-deploy/allowed-signers` before enabling it; the
+runner fails closed for unsigned deploy and rollback targets unless you
+explicitly set `CHUTE_DEPLOY_VERIFY_SIGNATURE=0`.
+
+`CHUTE_RELAY_IDLE_TIMEOUT` is disabled by default (`0`, `off`, `none`, `false`,
+or `unlimited` also disable it). If you enable it, chute resets a visitor stream
+after that many seconds with no relayed bytes in either direction. That is a
+deliberate no-progress policy: quiet SSE/WebSocket tunnels need application
+heartbeat bytes or a disabled/high timeout.
+
+The pinned control certificate is long-lived but not auto-renewed. `chuted run`
+logs a startup warning within 90 days of expiry, and refuses to start if the
+control cert/key cannot be parsed or loaded together. Rotation has no backup-pin
+overlap: generate a new pair with `chuted gen-cert --host <host>`, copy the new
+cert to every agent, update each `--server-cert` / `CHUTE_SERVER_CERT`, then
+restart `chuted` and the agents in the same maintenance window. Agents that
+still pin the old cert will not reconnect after the server switches.
+
 On the Mac, `deploy/com.chute.agent.plist` (launchd, `KeepAlive`) keeps an
-agent running across reboots.
+agent running across reboots. Put the token in a private file instead of the
+plist:
+
+```bash
+install -d -m 700 ~/.config/chute ~/Library/Logs/chute
+printf '%s\n' '<token from deploy.sh>' > ~/.config/chute/token
+chmod 600 ~/.config/chute/token
+```
+
+Then edit the plist's paths/host and load it. The sample uses `--token-file`
+so the token is not stored in `~/Library/LaunchAgents` and not exposed in the
+agent's command line.
 
 ## Security model
 
@@ -254,12 +340,17 @@ chute has one tunnel foundation: one authenticated agent registry, one admission
 path, one mux, and one relay. The only difference is how a visitor selects the
 registered tunnel:
 
+For the full ownership boundary — what chute core guarantees, what the proxy or
+operator owns, and what is explicitly not guaranteed — see
+[`docs/CONTROL-PLANE.md`](docs/CONTROL-PLANE.md#guarantees-matrix).
+
 |                                  | No `--base-domain`             | With `--base-domain`                        |
 | -------------------------------- | ------------------------------ | ------------------------------------------- |
 | Internal label                   | reserved `default`             | DNS label from `Host`                       |
 | Visitor admission                | strictly validated HTTP request head | strictly validated HTTP request head with Host |
 | Routing decision                 | always `default`               | pick the agent by `Host`, per connection    |
 | Public bind                      | can be exposed directly        | loopback-only; put nginx in front           |
+| Client-IP visitor cap            | chute sees the direct peer (IPv4 or IPv6 `/64`) | nginx sees the real client IP; bundled nginx keys exact `$binary_remote_addr` |
 | nginx upstream `keepalive`       | unnecessary                    | **dangerous** — re-creates the desync       |
 
 The default route has no tenant-selection input: any valid HTTP/1.x request goes
@@ -294,10 +385,108 @@ Because of #2, the Host-routed public port is **loopback-only** — chute refuse
 bind a routable address when `--base-domain` is set. It must sit behind a reverse
 proxy that opens one upstream connection per request. The bundled
 [`deploy/nginx-chute.conf`](deploy/nginx-chute.conf) does this by default: it has no
-`upstream {}` keepalive block — **don't add one**, that single line re-creates the
-desync. (Routing `Host` → a dynamic, runtime-assigned agent is the one job chute
-can't hand to nginx, which is why the router lives in chute while the
-one-request-per-connection guarantee lives in the proxy.)
+`upstream {}` keepalive block and it applies `limit_conn` to `$binary_remote_addr`
+so true client-IP visitor concurrency is capped before traffic reaches chute.
+That proxy cap keys exact IPv4/IPv6 addresses; unlike chute's direct-mode limiter,
+it does not group IPv6 privacy addresses by `/64`.
+**Don't add upstream keepalive**; that single line re-creates the desync. (Routing
+`Host` → a dynamic, runtime-assigned agent is the one job chute can't hand to
+nginx, which is why the router lives in chute while the one-request-per-connection
+and public client-IP guarantees live in the proxy.)
+
+## Open-core extension boundary
+
+chute core owns transport and live-runtime enforcement: the WSS control channel,
+HTTP visitor admission, label registration, mux streams, flow control, and the
+in-memory active-tunnel registry. It deliberately does **not** own accounts,
+billing, OAuth, teams, dashboards, or database schema.
+
+The control-plane boundary is documented in
+**[docs/CONTROL-PLANE.md](docs/CONTROL-PLANE.md)**. The first implemented seam is
+tunnel admission:
+
+- `ControlPlane.admit_tunnel()` receives a `TunnelAdmissionRequest` containing the
+  token, requested label, scheme, agent IP, and protocol version. It returns a
+  `TunnelAdmission` with account id, optional credential id, allowed-label policy,
+  tunnel cap, transport budget, and a tunnel lease. The default static-token path
+  wraps `StaticTokenAuthorizer` in `AuthorizerControlPlane`;
+  `StaticTokenControlPlane` is the equivalent built-in wrapper for the control
+  seam. Both preserve standalone single-token chute with a non-expiring lease.
+  Finite leases are enforced locally before opening visitor streams: expiry
+  removes the route, stops new visitors, and drains the mux.
+  `ControlPlane.renew_lease()` refreshes finite leases in the background with
+  jittered timers; a valid renewal must keep the lease finite with an aware future
+  expiry, malformed renewals are ignored until local expiry, and returning `None`
+  revokes immediately. Visitor budgets are
+  reserved and released in the relay, so `Budget.max_visitors` stays local and
+  constant-time on the hot path. `Budget.max_reconnects_per_min` is enforced
+  locally on the control channel before `ready`. `Budget.max_bytes_per_sec` is
+  enforced in the relay data path as an aggregate per-account, per-relay budget
+  shared by both forwarding directions; chunks are delayed before forwarding and
+  no visitor request calls the control plane. `Budget.max_buffered_bytes` caps
+  unread mux payload bytes per account on this relay, before DATA frames are
+  queued in chute-owned stream buffers.
+  `ControlPlane.poll_policy_updates()` delivers versioned revocation and account
+  budget deltas out of band; legacy lease-id revocations drain, structured
+  `LeaseRevocation` values can choose `drain` or immediate `close`, oversized
+  or malformed updates are rejected without changing last-good local policy, and
+  custom/cloud control planes get count-only poll requests unless they explicitly
+  opt into active lease-id snapshots.
+- Control-plane return objects are runtime-validated before they mutate relay
+  state: malformed admissions close retryably without registering a tunnel, and
+  malformed renewals or policy deltas keep last-good local policy.
+- `CHUTE_CONTROL_PLANE=module:attr` injects a custom `ControlPlane` into `chuted`.
+  The object may be an instance or a zero-argument factory. Use this for sidecar,
+  file-backed, or cloud-backed policy implementations.
+- `--policy-file` / `CHUTE_POLICY_FILE` enables the built-in
+  `StaticPolicyControlPlane`: a non-symlink chmod-600 JSON policy file in a
+  directory owned by the user running `chuted` (`chute` in the bundled systemd
+  unit) or root and not group- or world-writable,
+  with hashed token credentials, account ids, optional finite leases, budgets,
+  revocations, and budget updates.
+  Use `chuted gen-token --token-file <private-token-file>` to create and flush
+  the private token file without printing it, then
+  `chuted hash-token --token-file <private-token-file>` to
+  produce the `token_sha256` verifier without putting the token in a process
+  argument; token files must be owned by the user reading them and follow the
+  same non-symlink owner-only rule.
+  `allowed_label` values are normalized to lowercase and cannot be assigned to
+  multiple accounts. The file is validated at startup, unchanged files reuse the
+  cached parsed policy, and malformed or permission-loosened live edits keep the
+  last-good policy until a valid replacement appears. Run `chuted validate-policy --policy-file
+  <policy.json>` before replacing a live file or restarting the daemon. This is
+  the no-database path for self-hosted account policy.
+- `CHUTE_AUTHORIZER=module:attr` remains the simple admission-only extension hook
+  for local auth: it maps a token to an account, allowed label, tunnel cap, and
+  transport budget. It is not deprecated. `CHUTE_CONTROL_PLANE` is the full
+  lifecycle hook for admission plus finite leases, revocation, and policy-budget
+  updates. Set only one of `--policy-file` / `CHUTE_POLICY_FILE`,
+  `CHUTE_CONTROL_PLANE`, or `CHUTE_AUTHORIZER`.
+- `CHUTE_EVENT_SINK=module:attr` injects an `EventSink` for lifecycle/audit
+  events and low-cardinality relay stats: tunnel opened/closed, visitor
+  opened/closed, auth rejection, visitor rejection, and periodic aggregate stats.
+  `--event-log-file` / `CHUTE_EVENT_LOG_FILE` enables the built-in owner-only JSONL
+  sink for self-hosted audit trails; tunnel lifecycle events include the lease id
+  needed for file-backed revocation. Treat that file as metadata-sensitive because
+  it contains account ids, labels, Hosts, and IPs. Existing log files must be
+  owned by the user running `chuted` (`chute` in the bundled systemd unit), and
+  the parent directory must be owned by that user and not group- or
+  world-writable because default rotation renames files in that directory. The
+  built-in sink rotates by size by default
+  (`CHUTE_EVENT_LOG_MAX_BYTES`, default 100 MiB) and keeps a finite number of
+  owner-only backups (`CHUTE_EVENT_LOG_BACKUPS`, default 5). Set
+  `CHUTE_EVENT_LOG_MAX_BYTES=off` or `CHUTE_EVENT_LOG_BACKUPS=0` only when an
+  external log manager owns retention.
+  By default this is a no-op. Best-effort events are delivered through a bounded
+  relay-local queue with bounded retry, so exporter/database latency does not add
+  a visitor hot-path round trip; queue overflow logs and drops the event without
+  changing relay behavior. Fixed generated-event counters plus queue depth and
+  enqueue/deliver/retry/drop counters are exposed through relay stats and
+  `/metrics`. Set `CHUTE_REQUIRE_EVENT_SINK=1` when the tunnel-open event must
+  succeed synchronously before a tunnel is accepted.
+
+That is the intended boundary: a cloud service decides policy and persists events;
+chute enforces the returned decision and stays fully runnable without the cloud.
 
 ## Scope / non-goals
 

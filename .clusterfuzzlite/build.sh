@@ -25,4 +25,7 @@ EOF
   if [ -d "$PROJECT/fuzz/corpus/$target" ] && command -v zip >/dev/null 2>&1; then
     (cd "$PROJECT/fuzz/corpus/$target" && zip -qr "$OUT/${fuzzer_basename}_seed_corpus.zip" .)
   fi
+  if [ -f "$PROJECT/fuzz/dictionaries/$target.dict" ]; then
+    cp "$PROJECT/fuzz/dictionaries/$target.dict" "$OUT/$fuzzer_basename.dict"
+  fi
 done

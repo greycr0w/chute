@@ -5,7 +5,10 @@
   Fire-and-forget agent on your Mac. launchd keeps it alive across reboots,
   sleep/wake and crashes; the agent's own backoff loop handles network blips.
 
-  Edit the paths/host/token below, then:
+  Put the token in a private file, then edit the paths/host below:
+    install -d -m 700 ~/.config/chute ~/Library/Logs/chute
+    printf '%s\n' 'CHANGE_ME_TOKEN' > ~/.config/chute/token
+    chmod 600 ~/.config/chute/token
     cp deploy/com.chute.agent.plist ~/Library/LaunchAgents/
     launchctl load -w ~/Library/LaunchAgents/com.chute.agent.plist
   Stop with:
@@ -20,17 +23,13 @@
   <array>
     <string>/Users/CHANGE_ME/Development/chute/.venv/bin/chute</string>
     <string>8000</string>
-  </array>
-
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>CHUTE_SERVER</key>
+    <string>--server</string>
     <string>tunnel.example.com</string>
-    <key>CHUTE_TOKEN</key>
-    <string>CHANGE_ME</string>
-    <key>CHUTE_SERVER_CERT</key>
+    <string>--token-file</string>
+    <string>/Users/CHANGE_ME/.config/chute/token</string>
+    <string>--server-cert</string>
     <string>/Users/CHANGE_ME/Development/chute/chute-cert.pem</string>
-  </dict>
+  </array>
 
   <key>RunAtLoad</key>
   <true/>
@@ -39,8 +38,8 @@
   <key>ThrottleInterval</key>
   <integer>5</integer>
   <key>StandardOutPath</key>
-  <string>/tmp/chute.log</string>
+  <string>/Users/CHANGE_ME/Library/Logs/chute/agent.log</string>
   <key>StandardErrorPath</key>
-  <string>/tmp/chute.err</string>
+  <string>/Users/CHANGE_ME/Library/Logs/chute/agent.err.log</string>
 </dict>
 </plist>

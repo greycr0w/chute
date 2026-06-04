@@ -22,10 +22,12 @@ jobs:
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           enable-cache: true
+      - name: Install locked lint tools
+        run: uv sync --locked --extra dev
       - name: Ruff lint
-        run: uvx ruff@0.15.15 check --output-format=github .
+        run: uv run --no-sync ruff check --output-format=github .
       - name: Ruff format check
-        run: uvx ruff@0.15.15 format --check .
+        run: uv run --no-sync ruff format --check .
 
   types:
     runs-on: ubuntu-latest
@@ -46,6 +48,15 @@ jobs:
         run: |
           uv export --frozen --no-dev --no-emit-project -o deploy/requirements.txt
           git diff --exit-code -- deploy/requirements.txt
+      - name: Audit production dependencies
+        # Audit the same runtime dependency set prod installs, using the locked dev toolchain.
+        run: uv run --no-sync pip-audit -r deploy/requirements.txt --disable-pip
+      - name: deploy/build-requirements.txt matches its input
+        # Prod disables pip build isolation, so the build backend is pinned and hash-checked too.
+        run: |
+          uv pip compile --generate-hashes --universal \
+            deploy/build-requirements.in -o deploy/build-requirements.txt
+          git diff --exit-code -- deploy/build-requirements.txt
 
   test:
     runs-on: ubuntu-latest

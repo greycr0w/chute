@@ -15,10 +15,6 @@ import secrets
 # hyphen. (We lowercase before checking; DNS is case-insensitive.)
 _LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
-# Alphabet for auto-generated labels: lowercase alnum minus look-alikes
-# (no l/o/0/1) so a label is easy to read back off a screen or a log line.
-_ALPHABET = "abcdefghijkmnpqrstuvwxyz23456789"
-
 # Wordlists for friendly, ngrok-style labels (``swift-amber-otter``). All entries
 # are lowercase a-z only, so any combination is a valid DNS label well under the
 # 63-char cap. Keep them wholesome and unambiguous: a label may be read aloud,
@@ -183,11 +179,6 @@ _NOUNS = (
 def valid_label(label: str) -> bool:
     """True if *label* is a usable single DNS label."""
     return isinstance(label, str) and _LABEL_RE.fullmatch(label) is not None
-
-
-def random_label(length: int = 8) -> str:
-    """A fresh, unpredictable, DNS-safe label (e.g. ``k7m2pq9w``)."""
-    return "".join(secrets.choice(_ALPHABET) for _ in range(length))
 
 
 def random_phrase() -> str:

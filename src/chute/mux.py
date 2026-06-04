@@ -65,12 +65,16 @@ import contextlib
 import enum
 import logging
 import struct
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from . import protocol
 
 log = logging.getLogger("chute.mux")
+
+_BufferReserve = Callable[[int], bool]
+_BufferRelease = Callable[[int], None]
 
 # Initial per-stream send credit, in bytes, for each direction. A sender may have
 # at most this many bytes outstanding (sent but not yet WINDOW_UPDATE-acked) before
@@ -79,6 +83,12 @@ log = logging.getLogger("chute.mux")
 # stream. 256 KiB matches yamux's default: ample for interactive/tunnel traffic,
 # tunable upward for high-latency bulk transfer.
 _FLOW_WINDOW = 256 * 1024
+_MAX_FLOW_WINDOW = 16 * 1024 * 1024
+
+# The WebSocket layer caps any single message at 256 KiB. A mux DATA frame carries
+# a 5-byte protocol prefix, so chunk local sends to fit under that transport cap
+# even when a caller hands Stream.send() a larger buffer directly.
+_MAX_FRAME_PAYLOAD = 256 * 1024 - protocol.PREFIX_SIZE
 
 # Hard ceiling on accumulated send credit (RFC 9113 6.9.1's 2^31-1 window cap): a
 # peer that floods large WINDOW_UPDATE grants can't grow our window without bound. A
@@ -148,6 +158,30 @@ _WRITE_STALL_TIMEOUT = 30.0
 # (it is force-closed at the deadline and the visitor reconnects).
 _DRAIN_GRACE = 10.0
 
+# Graceful WebSocket close should be bounded independently from stream drain. A
+# peer that has stopped reading can otherwise pin shutdown during close as well as
+# during DATA sends; after this deadline we fall back to transport abort.
+_CLOSE_TIMEOUT = 5.0
+_MUX_LOG_INTERVAL = 60.0
+_MUX_LOG_MAX_KEYS = 256
+
+# Per-connection cap for non-actionable inbound frames: malformed frames, unknown
+# stream ids, duplicate GOAWAY, etc. A few late frames are normal during races; a
+# flood is authenticated-peer churn and should not burn CPU indefinitely.
+_MAX_IGNORED_FRAMES = 65_536
+
+
+def validate_flow_window(value: object, *, name: str = "flow_window") -> int:
+    """Validate a negotiated mux flow-control window, in bytes."""
+
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer byte count")
+    if value < 1:
+        raise ValueError(f"{name} must be >= 1 byte")
+    if value > _MAX_FLOW_WINDOW:
+        raise ValueError(f"{name} must be <= {_MAX_FLOW_WINDOW} bytes")
+    return value
+
 
 class _StreamClosed(Exception):
     """Raised by ``Stream.send`` when the stream has been torn down mid-transfer,
@@ -195,8 +229,9 @@ class Stream:
         self._unacked = 0  # bytes drained downstream since the last WINDOW_UPDATE we sent
 
         # -- send side --
-        self._send_window = _FLOW_WINDOW  # credit we may send before awaiting a WINDOW_UPDATE
+        self._send_window = mux.flow_window  # credit we may send before awaiting WINDOW_UPDATE
         self._send_ended = False
+        self._send_lock = asyncio.Lock()
         # set on a credit grant OR on close, to wake a sender parked on the window
         self._window_waiter = asyncio.Event()
 
@@ -223,44 +258,46 @@ class Stream:
         """Send ``data`` to the peer, respecting the credit window. Blocks while
         the window is exhausted (backpressure); raises :class:`_StreamClosed` if
         the stream is torn down while sending."""
-        if self._closed or self._send_ended:
-            # Closed, or we already sent our EOF -- either way the send side is done.
-            # Refuse new DATA: sending after EOF is a local protocol error (our own
-            # pumps never do it), so this is a guard against a refactor, not a hot path.
-            raise _StreamClosed
-        view = memoryview(data)
-        while len(view):
-            while self._send_window <= 0:
-                if self._closed:
-                    raise _StreamClosed
-                # Clear-then-recheck closes the lost-wakeup race: a grant landing
-                # between the while-test and the wait would have set the event,
-                # which we observe on the recheck (or on the wait if still empty).
-                self._window_waiter.clear()
-                if self._send_window > 0 or self._closed:
-                    break
-                try:
-                    await asyncio.wait_for(
-                        self._window_waiter.wait(), timeout=_CREDIT_STALL_TIMEOUT
-                    )
-                except TimeoutError:
-                    # No credit for the whole stall window: the peer is dead or not
-                    # honoring flow control. Bail; the caller's pump RESETs the stream
-                    # (notifying the peer) and frees the slot, instead of blocking forever.
-                    self._mux._stats["credit_stall"] += 1
-                    raise _StreamClosed from None
-            if self._closed:
+        async with self._send_lock:
+            if self._closed or self._send_ended:
+                # Closed, or we already sent our EOF -- either way the send side is done.
+                # Refuse new DATA: sending after EOF is a local protocol error (our own
+                # pumps never do it), so this is a guard against a refactor, not a hot path.
                 raise _StreamClosed
-            n = min(len(view), self._send_window)
-            self._send_window -= n
-            await self._mux._send(protocol.DATA, self.id, bytes(view[:n]))
-            view = view[n:]
+            view = memoryview(data)
+            while len(view):
+                while self._send_window <= 0:
+                    if self._closed or self._send_ended:
+                        raise _StreamClosed
+                    # Clear-then-recheck closes the lost-wakeup race: a grant landing
+                    # between the while-test and the wait would have set the event,
+                    # which we observe on the recheck (or on the wait if still empty).
+                    self._window_waiter.clear()
+                    if self._send_window > 0 or self._closed or self._send_ended:
+                        break
+                    try:
+                        await asyncio.wait_for(
+                            self._window_waiter.wait(), timeout=_CREDIT_STALL_TIMEOUT
+                        )
+                    except TimeoutError:
+                        # No credit for the whole stall window: the peer is dead or not
+                        # honoring flow control. Bail; the caller's pump RESETs the stream
+                        # (notifying the peer) and frees the slot, instead of blocking forever.
+                        self._mux._stats["credit_stall"] += 1
+                        raise _StreamClosed from None
+                if self._closed or self._send_ended:
+                    raise _StreamClosed
+                n = min(len(view), self._send_window, _MAX_FRAME_PAYLOAD)
+                self._send_window -= n
+                await self._mux._send(protocol.DATA, self.id, bytes(view[:n]))
+                view = view[n:]
 
     async def send_eof(self) -> None:
-        if self._closed or self._send_ended:
-            return
-        self._send_ended = True
-        await self._mux._send(protocol.EOF, self.id, b"")
+        async with self._send_lock:
+            if self._closed or self._send_ended:
+                return
+            self._send_ended = True
+            await self._mux._send(protocol.EOF, self.id, b"")
 
     def _grant(self, delta: int) -> None:
         """Peer returned ``delta`` bytes of credit (WINDOW_UPDATE). The caller in
@@ -286,6 +323,7 @@ class Stream:
             self._recv_frames -= 1
             self._mux._buffered -= len(chunk)
             self._mux._frames -= 1
+            self._mux._release_buffer(len(chunk))
         return chunk
 
     async def ack(self, n: int) -> None:
@@ -294,7 +332,7 @@ class Stream:
         if self._closed or self.reset_by_peer or n <= 0:
             return
         self._unacked += n
-        if self._unacked >= _WINDOW_UPDATE_THRESHOLD:
+        if self._unacked >= self._mux.window_update_threshold:
             delta, self._unacked = self._unacked, 0
             with contextlib.suppress(Exception):
                 await self._mux._send(protocol.WINDOW_UPDATE, self.id, struct.pack("!I", delta))
@@ -317,15 +355,22 @@ class Stream:
         # aggregated across the whole connection -- the connection frame cap is what
         # bounds per-frame object overhead, not just payload bytes. Any breach is a
         # flow-control violation -> RESET this stream.
-        if (
-            next_stream_buffered > _STREAM_HARD_MAX
-            or next_stream_frames > _MAX_QUEUED_FRAMES
-            or next_mux_buffered > _MAX_CONN_BUFFERED
-            or next_mux_frames > _MAX_CONN_FRAMES
-        ):
+        detail = None
+        if next_stream_buffered > self._mux.stream_hard_max:
+            detail = "stream_bytes"
+        elif next_stream_frames > self._mux.max_queued_frames:
+            detail = "stream_frames"
+        elif next_mux_buffered > _MAX_CONN_BUFFERED:
+            detail = "connection_bytes"
+        elif next_mux_frames > _MAX_CONN_FRAMES:
+            detail = "connection_frames"
+        elif not self._mux._reserve_buffer(len(data)):
+            detail = "account_buffer"
+        if detail is not None:
             # Mark RESET synchronously so the very next _feed drops and the consumer
             # wakes with an abort terminal now; finish teardown + notify the peer off
             # the demux path.
+            self._mux._log_event(logging.WARNING, "stream_buffer_limit", self.id, detail=detail)
             self._end_recv(_RecvState.RESET)
             self._mux._spawn(self.reset())
             return
@@ -390,6 +435,7 @@ class Stream:
         # drifts across a stream's lifetime.
         self._mux._buffered -= self._recv_buffered
         self._mux._frames -= self._recv_frames
+        self._mux._release_buffer(self._recv_buffered)
         self._recv_buffered = 0
         self._recv_frames = 0
         self._end_recv(recv_terminal)  # no-op if the lane already reached a terminal
@@ -410,18 +456,33 @@ class Mux:
         on_open: Callable[[Stream], Awaitable[None]] | None = None,
         on_goaway: Callable[[], None] | None = None,
         max_streams: int = _MAX_STREAMS,
+        buffer_reserve: _BufferReserve | None = None,
+        buffer_release: _BufferRelease | None = None,
+        flow_window: int | None = None,
     ) -> None:
+        if flow_window is None:
+            self.flow_window = validate_flow_window(_FLOW_WINDOW)
+            self.window_update_threshold = max(1, _WINDOW_UPDATE_THRESHOLD)
+            self.stream_hard_max = _STREAM_HARD_MAX
+            self.max_queued_frames = _MAX_QUEUED_FRAMES
+        else:
+            self.flow_window = validate_flow_window(flow_window)
+            self.window_update_threshold = max(1, self.flow_window // 2)
+            self.stream_hard_max = 2 * self.flow_window
+            self.max_queued_frames = self.flow_window
         self._ws = ws
         self._on_open = on_open
         # Fired once when the peer sends GOAWAY (it is draining). The owner uses it to
-        # stop routing NEW work to this connection while in-flight streams finish: the
-        # server deregisters the agent; the agent just logs (its reconnect loop handles
-        # the clean close that follows).
+        # stop routing NEW work to this connection while in-flight streams finish.
         self._on_goaway = on_goaway
         self._streams: dict[int, Stream] = {}
         self._next_id = 1
         self._tasks: set[asyncio.Task[None]] = set()
+        self._reset_sends: set[int] = set()
         self._max_streams = max_streams
+        self._buffer_reserve = buffer_reserve
+        self._buffer_release = buffer_release
+        self._log_state: dict[tuple[str, int | None], tuple[float, int]] = {}
         self._buffered = 0  # sum of unread bytes across all streams (connection cap)
         self._frames = 0  # sum of unread frame COUNT across all streams (per-frame cap)
         # Graceful drain (GOAWAY): _going_away once WE announce it (open() then refuses);
@@ -437,7 +498,10 @@ class Mux:
             "reset_peer": 0,
             "credit_stall": 0,
             "write_stall": 0,
+            "close_stall": 0,
             "goaway_in": 0,
+            "ignored_frames": 0,
+            "ignored_frame_limit": 0,
         }
 
     async def open(self) -> Stream:
@@ -501,12 +565,26 @@ class Mux:
                 break
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._idle.wait(), timeout=remaining)
-        await self.aclose(code=1001, reason="going away")
+        try:
+            await asyncio.wait_for(
+                self.aclose(code=1001, reason="going away"),
+                timeout=_CLOSE_TIMEOUT,
+            )
+        except TimeoutError:
+            self._stats["close_stall"] += 1
+            self._log_event(logging.WARNING, "close_stall", 0)
+            with contextlib.suppress(Exception):
+                self._ws.transport.abort()
 
     @property
     def active_streams(self) -> int:
         """Live stream count on this connection (drift-free; derived from state)."""
         return len(self._streams)
+
+    @property
+    def draining(self) -> bool:
+        """Whether either side has announced GOAWAY for this connection."""
+        return self._going_away or self._peer_going_away
 
     def stats(self) -> dict[str, int]:
         """Snapshot of counters + live gauges, for an operator's periodic log or a
@@ -533,9 +611,20 @@ class Mux:
             # breaker the per-stream credit-stall can't provide -- it never engages
             # here, because the block is on ws.send(), not on the credit wait.
             self._stats["write_stall"] += 1
+            self._log_event(logging.WARNING, "write_stall", sid)
             with contextlib.suppress(Exception):
                 self._ws.transport.abort()
             raise
+
+    def _reserve_buffer(self, n: int) -> bool:
+        if n <= 0 or self._buffer_reserve is None:
+            return True
+        return self._buffer_reserve(n)
+
+    def _release_buffer(self, n: int) -> None:
+        if n <= 0 or self._buffer_release is None:
+            return
+        self._buffer_release(n)
 
     def _remove(self, sid: int) -> None:
         self._streams.pop(sid, None)
@@ -546,6 +635,50 @@ class Mux:
         task = asyncio.ensure_future(coro)
         self._tasks.add(task)
         task.add_done_callback(self._task_done)
+
+    def _send_reset(self, sid: int) -> None:
+        if sid == 0 or sid in self._reset_sends:
+            return
+        if len(self._reset_sends) >= self._max_streams:
+            return
+        self._reset_sends.add(sid)
+
+        async def _send_once() -> None:
+            try:
+                with contextlib.suppress(Exception):
+                    await self._send(protocol.RESET, sid, b"")
+            finally:
+                self._reset_sends.discard(sid)
+
+        self._spawn(_send_once())
+
+    def _log_event(
+        self, level: int, reason: str, sid: int | None = None, *, detail: str | None = None
+    ) -> None:
+        """Rate-limited metadata-only mux failure log."""
+        key = (reason, sid)
+        now = time.monotonic()
+        existing = self._log_state.get(key)
+        if existing is not None:
+            last, suppressed = existing
+            if now - last < _MUX_LOG_INTERVAL:
+                self._log_state[key] = (last, suppressed + 1)
+                return
+        else:
+            while len(self._log_state) >= _MUX_LOG_MAX_KEYS:
+                self._log_state.pop(next(iter(self._log_state)))
+            suppressed = 0
+        fields = [
+            f"reason={reason}",
+            f"sid={sid}" if sid is not None else None,
+            f"detail={detail!r}" if detail is not None else None,
+            f"active_streams={self.active_streams}",
+            f"buffered_bytes={self._buffered}",
+            f"queued_frames={self._frames}",
+            f"suppressed={suppressed}" if suppressed else None,
+        ]
+        log.log(level, "mux | %s", " ".join(field for field in fields if field is not None))
+        self._log_state[key] = (now, 0)
 
     def _task_done(self, task: asyncio.Task[None]) -> None:
         self._tasks.discard(task)
@@ -558,6 +691,16 @@ class Mux:
                 "mux background task failed",
                 exc_info=(type(exc), exc, exc.__traceback__),
             )
+
+    def _ignore_frame(self, reason: str, sid: int | None = None) -> bool:
+        self._stats["ignored_frames"] += 1
+        if self._stats["ignored_frames"] < _MAX_IGNORED_FRAMES:
+            return False
+        self._stats["ignored_frame_limit"] += 1
+        self._log_event(logging.WARNING, "ignored_frame_limit", sid, detail=reason)
+        with contextlib.suppress(Exception):
+            self._ws.transport.abort()
+        return True
 
     async def _run_on_open(self, stream: Stream) -> None:
         try:
@@ -579,28 +722,45 @@ class Mux:
         try:
             async for message in self._ws:
                 if not isinstance(message, bytes):
+                    if self._ignore_frame("non_binary"):
+                        break
                     continue  # binary frames are bytes; ignore stray text (str) frames
                 try:
                     ftype, sid, payload = protocol.decode(message)
                 except ValueError:
+                    if self._ignore_frame("malformed"):
+                        break
                     continue  # malformed/short frame: drop it, keep the mux alive
                 if ftype == protocol.OPEN:
                     if sid == 0:
+                        if self._ignore_frame("open_sid_zero", sid):
+                            break
+                        continue
+                    if payload:
+                        if self._on_open is not None:
+                            self._send_reset(sid)
+                        elif self._ignore_frame("open_payload", sid):
+                            break
                         continue
                     if self._on_open is None:
                         # The server never accepts peer-opened streams; ignore so
                         # a malicious agent can't grow the registry with OPENs.
+                        if self._ignore_frame("open_not_accepted", sid):
+                            break
                         continue
                     if self._going_away or self._peer_going_away:
-                        self._spawn(self._send(protocol.RESET, sid, b""))
+                        self._log_event(logging.WARNING, "open_after_goaway", sid)
+                        self._send_reset(sid)
                         continue
                     if sid in self._streams:
                         # Duplicate OPEN for a live id: refuse it (RESET) instead of
                         # silently overwriting the first handler + its local socket.
-                        self._spawn(self._send(protocol.RESET, sid, b""))
+                        self._log_event(logging.WARNING, "duplicate_open", sid)
+                        self._send_reset(sid)
                         continue
                     if len(self._streams) >= self._max_streams:
-                        self._spawn(self._send(protocol.RESET, sid, b""))
+                        self._log_event(logging.WARNING, "stream_limit", sid)
+                        self._send_reset(sid)
                         continue
                     stream = Stream(self, sid)
                     self._streams[sid] = stream
@@ -608,49 +768,82 @@ class Mux:
                     self._spawn(self._run_on_open(stream))
                 elif ftype == protocol.DATA:
                     if sid == 0:
+                        if self._ignore_frame("data_sid_zero", sid):
+                            break
                         continue
                     if (s := self._streams.get(sid)) is not None:
                         s._feed(payload)
+                    elif self._ignore_frame("data_unknown", sid):
+                        break
                 elif ftype == protocol.EOF:
                     if sid == 0:
+                        if self._ignore_frame("eof_sid_zero", sid):
+                            break
                         continue
                     if (s := self._streams.get(sid)) is not None:
+                        if payload:
+                            if s._reset_local_now():
+                                self._send_reset(sid)
+                            continue
                         s._feed_eof()
+                    elif self._ignore_frame("eof_unknown", sid):
+                        break
                 elif ftype == protocol.WINDOW_UPDATE:
                     if sid == 0:
+                        if self._ignore_frame("window_update_sid_zero", sid):
+                            break
                         continue
                     if (s := self._streams.get(sid)) is not None:
                         if len(payload) != 4:
                             # A credit frame is exactly 4 bytes; anything else is
                             # malformed -- reset the stream instead of guessing.
                             if s._reset_local_now():
-                                self._spawn(self._send(protocol.RESET, sid, b""))
+                                self._log_event(
+                                    logging.WARNING,
+                                    "bad_window_update",
+                                    sid,
+                                    detail=f"len={len(payload)}",
+                                )
+                                self._send_reset(sid)
                         else:
                             (delta,) = struct.unpack_from("!I", payload)
                             if delta != 0:
                                 s._grant(delta)
+                            elif self._ignore_frame("window_update_zero", sid):
+                                break
                             # delta == 0 is a no-op grant: drop it WITHOUT waking the
                             # credit waiter, so it can't reset the per-wait stall clock
                             # and keep a blocked sender alive forever.
+                    elif self._ignore_frame("window_update_unknown", sid):
+                        break
                 elif ftype == protocol.RESET:
                     if sid == 0:
+                        if self._ignore_frame("reset_sid_zero", sid):
+                            break
                         continue
                     if (s := self._streams.get(sid)) is not None:
                         self._stats["reset_peer"] += 1
                         s._abort()
+                    elif self._ignore_frame("reset_unknown", sid):
+                        break
                 elif ftype == protocol.GOAWAY:
-                    if sid != 0:
+                    if sid != 0 or payload:
+                        if self._ignore_frame("bad_goaway", sid):
+                            break
                         continue
                     # Peer is draining: it will open no new streams and will close once
                     # in-flight ones finish. Note it and let the owner stop routing NEW
-                    # work here (server deregisters the agent; agent logs, and its
-                    # reconnect loop handles the clean close). In-flight streams continue.
+                    # work here. In-flight streams continue.
                     if self._peer_going_away:
+                        if self._ignore_frame("duplicate_goaway", sid):
+                            break
                         continue
                     self._peer_going_away = True
                     self._stats["goaway_in"] += 1
                     if self._on_goaway is not None:
                         self._on_goaway()
+                elif self._ignore_frame("unknown_type", sid):
+                    break
         finally:
             for stream in list(self._streams.values()):
                 stream._abort()
