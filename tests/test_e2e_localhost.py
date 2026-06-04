@@ -96,6 +96,22 @@ def _request(
         conn.close()
 
 
+async def _read_http_response(reader: asyncio.StreamReader, timeout: float = 5) -> bytes:
+    head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=timeout)
+    content_length = 0
+    for line in head.split(b"\r\n")[1:]:
+        name, _, value = line.partition(b":")
+        if name.lower() == b"content-length":
+            content_length = int(value.strip())
+            break
+    body = (
+        await asyncio.wait_for(reader.readexactly(content_length), timeout=timeout)
+        if content_length
+        else b""
+    )
+    return head + body
+
+
 def _start_local_app() -> tuple[int, ThreadingHTTPServer]:
     port = _free_port()
     httpd = ThreadingHTTPServer(("127.0.0.1", port), _Echo)
@@ -240,7 +256,7 @@ async def test_default_route_accepts_valid_http_without_host(tmp_path: Path) -> 
         reader, writer = await asyncio.open_connection("127.0.0.1", h.public_port)
         writer.write(b"GET /nohost HTTP/1.0\r\n\r\n")
         await writer.drain()
-        response = await asyncio.wait_for(reader.read(4096), timeout=5)
+        response = await _read_http_response(reader)
         assert b"HTTP/1.1 200" in response or b"HTTP/1.0 200" in response
         assert b"echo:/nohost:" in response
     finally:
