@@ -32,6 +32,7 @@ CERT_ROOT="${CHUTE_CERT_ROOT:-/home/letsencrypt/chute/certs}"
 AGENT_CIDRS="${CHUTE_AGENT_CIDRS:-}"
 ALLOW_OPEN_CONTROL="${CHUTE_ALLOW_OPEN_CONTROL:-0}"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
+SOURCE_GIT_HEAD="$(git -C "$HERE" rev-parse --verify HEAD 2>/dev/null || true)"
 
 echo "==> [1/2] syncing source to $REMOTE:/opt/chute/src"
 ssh "$REMOTE" 'mkdir -p /opt/chute/src /etc/chute'
@@ -44,9 +45,24 @@ echo "==> [2/2] installing on the box (venv + systemd + nginx)"
 ssh "$REMOTE" \
   BASE_DOMAIN="$BASE_DOMAIN" PUBLIC_PORT="$PUBLIC_PORT" CONTROL_PORT="$CONTROL_PORT" \
   CERT_ROOT="$CERT_ROOT" AGENT_CIDRS="$AGENT_CIDRS" ALLOW_OPEN_CONTROL="$ALLOW_OPEN_CONTROL" \
+  SOURCE_GIT_HEAD="$SOURCE_GIT_HEAD" \
   'bash -s' <<'REMOTE_SCRIPT'
 set -euo pipefail
 : "${BASE_DOMAIN:?}" "${PUBLIC_PORT:?}" "${CONTROL_PORT:?}" "${CERT_ROOT:?}"
+
+# If /opt/chute/src is also the git checkout used by CD, keep its HEAD aligned
+# with the source commit this manual deploy is refreshing. That prevents the
+# next forced-command deploy from re-detecting already-applied config changes.
+if [ -n "${SOURCE_GIT_HEAD:-}" ] && git -C /opt/chute/src rev-parse --git-dir >/dev/null 2>&1; then
+  if ! git -C /opt/chute/src cat-file -e "$SOURCE_GIT_HEAD^{commit}" 2>/dev/null; then
+    git -C /opt/chute/src fetch --quiet origin "+refs/heads/main:refs/remotes/origin/main" || true
+  fi
+  if git -C /opt/chute/src cat-file -e "$SOURCE_GIT_HEAD^{commit}" 2>/dev/null; then
+    git -C /opt/chute/src reset --hard --quiet "$SOURCE_GIT_HEAD"
+  else
+    echo "    NOTE: source git commit $SOURCE_GIT_HEAD is not present in /opt/chute/src; leaving remote git metadata unchanged" >&2
+  fi
+fi
 
 # 1) dedicated service user (no shell, no home churn)
 id -u chute >/dev/null 2>&1 || \

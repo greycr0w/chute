@@ -34,6 +34,11 @@ deploys. The deploy runner reads `.python-version`, runs `uv python install`,
 and recreates `/opt/chute/.venv` with that pinned Python minor before installing
 the hash-pinned requirements.
 
+When `deploy/deploy.sh` refreshes a box whose `/opt/chute/src` is a git clone,
+it also aligns that checkout's HEAD to the local source commit if the commit is
+present after fetching `origin/main`. That keeps the next day-to-day CD run from
+refusing an already-applied deployment-owned config change.
+
 ## One-time bootstrap on the VPS
 
 ```bash

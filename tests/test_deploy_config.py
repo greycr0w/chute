@@ -300,6 +300,23 @@ def test_deploy_installs_stable_forced_command_runner() -> None:
     assert 'command="/opt/chute/src/deploy/deploy-pull.sh"' not in cd_setup
 
 
+def test_manual_deploy_aligns_cd_git_metadata_when_present() -> None:
+    script = (ROOT / "deploy" / "deploy.sh").read_text()
+
+    assert 'SOURCE_GIT_HEAD="$(git -C "$HERE" rev-parse --verify HEAD' in script
+    assert 'SOURCE_GIT_HEAD="$SOURCE_GIT_HEAD"' in script
+    assert "git -C /opt/chute/src rev-parse --git-dir" in script
+    assert (
+        'git -C /opt/chute/src fetch --quiet origin "+refs/heads/main:refs/remotes/origin/main"'
+    ) in script
+    assert 'git -C /opt/chute/src reset --hard --quiet "$SOURCE_GIT_HEAD"' in script
+
+    align_metadata = script.index("If /opt/chute/src is also the git checkout used by CD")
+    user_setup = script.index("id -u chute")
+    install_stable_runner = script.index("install -m 0755 -o root -g root")
+    assert align_metadata < user_setup < install_stable_runner
+
+
 def test_cd_workflow_keeps_production_deploy_simple() -> None:
     workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text()
 
