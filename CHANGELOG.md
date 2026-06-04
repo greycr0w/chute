@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Manual deploy refreshes now keep `/opt/chute/src` git metadata aligned when
   that path is also the CD checkout, avoiding repeated false positives for
   already-applied deployment-owned config changes.
+- Forced-command deploys now fail fast on venv, install, nginx, or systemd
+  failures instead of letting a later successful command mask a broken deploy.
 
 ## [0.4.0] - 2026-06-04
 
