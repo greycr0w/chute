@@ -25,6 +25,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
         with:
+          version: "0.5.26"
           enable-cache: true
       - name: Choose fuzz depth
         run: |
@@ -38,7 +39,7 @@ jobs:
       - name: Install locked fuzz environment
         run: uv sync --locked --extra dev --extra fuzz --python 3.11
       - name: Structure-aware fuzz tests
-        run: uv run --no-sync pytest -q tests/test_fuzz_mux.py tests/test_fuzz_harnesses.py tests/test_host_parsing.py
+        run: uv run --no-sync python -m pytest -q tests/test_fuzz_mux.py tests/test_fuzz_harnesses.py tests/test_host_parsing.py
       - name: Atheris bounded fuzzers
         run: uv run --no-sync python -m fuzz.run_atheris --runs "$ATHERIS_RUNS"
 
