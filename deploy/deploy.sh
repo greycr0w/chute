@@ -80,7 +80,7 @@ command -v uv >/dev/null 2>&1 || {
   exit 1
 }
 uv python install "$PYTHON_VERSION"
-uv venv --python "$PYTHON_VERSION" /opt/chute/.venv
+uv venv --clear --python "$PYTHON_VERSION" /opt/chute/.venv
 # chute itself is then installed without dependency resolution or build isolation.
 /opt/chute/.venv/bin/pip install --quiet --require-hashes -r /opt/chute/src/deploy/requirements.txt
 /opt/chute/.venv/bin/pip install --quiet --require-hashes -r /opt/chute/src/deploy/build-requirements.txt
