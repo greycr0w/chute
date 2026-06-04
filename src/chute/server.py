@@ -675,6 +675,7 @@ class Server:
         public_tls = None
         metrics = None
         background: list[asyncio.Task[None]] = []
+        event_worker: asyncio.Task[None] | None = None
         try:
             public = await asyncio.start_server(
                 self._handle_visitor,
@@ -746,7 +747,8 @@ class Server:
         if self.policy_poll_interval > 0:
             background.append(asyncio.ensure_future(self._poll_policy_updates()))
         if not isinstance(self.event_sink, NoopEventSink):
-            background.append(asyncio.ensure_future(self._run_event_queue()))
+            event_worker = asyncio.ensure_future(self._run_event_queue())
+            background.append(event_worker)
 
         try:
             await shutdown.wait()
@@ -771,8 +773,12 @@ class Server:
                 public_tls.close()
             if metrics is not None:
                 metrics.close()
+            # Keep the event worker alive while mux teardown emits final lifecycle
+            # events. On Python 3.11, canceling a Queue.get waiter and then enqueueing
+            # before it resumes can lose the intended worker shutdown.
             for task in background:
-                task.cancel()
+                if task is not event_worker:
+                    task.cancel()
             # GOAWAY each agent and wait (bounded) for its in-flight visitor streams to
             # finish, then close. A permanent SSE/WS stream is force-closed at the deadline.
             await asyncio.gather(*(mux.drain(timeout) for mux in muxes), return_exceptions=True)
@@ -782,6 +788,8 @@ class Server:
                         await asyncio.wait_for(srv.wait_closed(), timeout=5.0)
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(control.wait_closed(), timeout=5.0)
+            if event_worker is not None:
+                event_worker.cancel()
             if background:
                 await asyncio.gather(*background, return_exceptions=True)
 
