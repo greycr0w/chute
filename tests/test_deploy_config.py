@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import tomllib
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -576,15 +577,26 @@ def test_shell_scripts_are_valid_bash() -> None:
         assert result.returncode == 0, result.stderr
 
 
-def test_rendered_nginx_validates_when_nginx_available(tmp_path: Path) -> None:
+def test_rendered_nginx_validates_when_nginx_available(
+    tmp_path: Path,
+    unused_tcp_port_factory: Callable[[], int],
+) -> None:
     nginx = shutil.which("nginx")
     if nginx is None:
         pytest.skip("nginx is not installed")
 
+    http_port = unused_tcp_port_factory()
+    https_port = unused_tcp_port_factory()
     cert_dir = tmp_path / "certs" / "example.net"
     cert_dir.mkdir(parents=True)
     certs.generate("example.net", cert_dir / "fullchain.pem", cert_dir / "privkey.pem")
-    rendered = _render_nginx("example.net", 18080, str(tmp_path / "certs"))
+    rendered = (
+        _render_nginx("example.net", 18080, str(tmp_path / "certs"))
+        .replace("listen 80;", f"listen {http_port};")
+        .replace("listen [::]:80;", f"listen [::]:{http_port};")
+        .replace("listen 443 ssl http2;", f"listen {https_port} ssl http2;")
+        .replace("listen [::]:443 ssl http2;", f"listen [::]:{https_port} ssl http2;")
+    )
 
     nginx_root = tmp_path / "nginx"
     nginx_root.mkdir()
