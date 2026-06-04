@@ -482,7 +482,7 @@ def test_python_and_uv_toolchain_are_pinned_for_ci_and_deploy() -> None:
     assert "PYTHON_VERSION=\"$(tr -d '[:space:]' </opt/chute/src/.python-version)\"" in deploy
     assert "command -v uv >/dev/null 2>&1 || {" in deploy
     assert 'uv python install "$PYTHON_VERSION"' in deploy
-    assert 'uv venv --clear --python "$PYTHON_VERSION" /opt/chute/.venv' in deploy
+    assert 'uv venv --clear --seed --python "$PYTHON_VERSION" /opt/chute/.venv' in deploy
     assert "python3 -m venv" not in deploy
 
     assert "ensure_pinned_venv()" in pull
@@ -493,7 +493,7 @@ def test_python_and_uv_toolchain_are_pinned_for_ci_and_deploy() -> None:
     assert 'python_version="$(tr -d \'[:space:]\' <"$REPO/.python-version")"' in pull
     assert 'command -v uv >/dev/null 2>&1 || die "uv is required' in pull
     assert 'uv python install "$python_version"' in pull
-    assert 'uv venv --clear --python "$python_version" "$VENV"' in pull
+    assert 'uv venv --clear --seed --python "$python_version" "$VENV"' in pull
     assert "python3 -m venv" not in pull
 
     assert "install `uv` once" in readme

@@ -196,7 +196,7 @@ ensure_pinned_venv() {
   command -v uv >/dev/null 2>&1 || die "uv is required to provision pinned Python $python_version"
   mkdir -p "$UV_CACHE_DIR" "$UV_PYTHON_INSTALL_DIR"
   uv python install "$python_version"
-  uv venv --clear --python "$python_version" "$VENV"
+  uv venv --clear --seed --python "$python_version" "$VENV"
 }
 
 install_and_restart() {
