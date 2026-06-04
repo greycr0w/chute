@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Repaired the hardened deploy path for current `uv`: deploy venvs are recreated
+  explicitly, seeded with `pip`, and backed by a service-readable uv-managed
+  Python tree under `/opt/chute/uv`.
+- Manual deploy refreshes now keep `/opt/chute/src` git metadata aligned when
+  that path is also the CD checkout, avoiding repeated false positives for
+  already-applied deployment-owned config changes.
+
 ## [0.4.0] - 2026-06-04
 
 ### Breaking
