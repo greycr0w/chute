@@ -596,7 +596,7 @@ def test_rendered_nginx_validates_when_nginx_available(tmp_path: Path) -> None:
         f"pid {nginx_root / 'nginx.pid'};\n"
         f"error_log {nginx_root / 'logs' / 'error.log'};\n"
         "events {}\n"
-        f"http {{ include {chute_conf}; }}\n"
+        f"http {{ access_log {nginx_root / 'logs' / 'access.log'}; include {chute_conf}; }}\n"
     )
 
     result = subprocess.run(
