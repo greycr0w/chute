@@ -42,7 +42,7 @@ def test_nginx_template_keeps_http_and_https_without_forced_upgrade() -> None:
     active_config = _without_comments(rendered).lower()
 
     assert re.search(r"listen\s+80;", rendered)
-    assert re.search(r"listen\s+443\s+ssl;", rendered)
+    assert re.search(r"listen\s+443\s+ssl\s+http2;", rendered)
     assert "return 301" not in active_config
     assert "return 308" not in active_config
     assert "rewrite " not in active_config

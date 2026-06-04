@@ -39,9 +39,9 @@ jobs:
       - name: Install locked fuzz environment
         run: uv sync --locked --extra dev --extra fuzz --python 3.11
       - name: Structure-aware fuzz tests
-        run: uv run --no-sync python -m pytest -q tests/test_fuzz_mux.py tests/test_fuzz_harnesses.py tests/test_host_parsing.py
+        run: .venv/bin/python -m pytest -q tests/test_fuzz_mux.py tests/test_fuzz_harnesses.py tests/test_host_parsing.py
       - name: Atheris bounded fuzzers
-        run: uv run --no-sync python -m fuzz.run_atheris --runs "$ATHERIS_RUNS"
+        run: .venv/bin/python -m fuzz.run_atheris --runs "$ATHERIS_RUNS"
 
   clusterfuzzlite-code-change:
     if: github.event_name == 'pull_request'

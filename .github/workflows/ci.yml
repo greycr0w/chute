@@ -77,4 +77,4 @@ jobs:
       - name: Install (locked)
         run: uv sync --locked --extra dev --python ${{ matrix.python-version }}
       - name: Test
-        run: uv run --no-sync python -m pytest -q --cov=chute --cov-report=term-missing
+        run: .venv/bin/python -m pytest -q --cov=chute --cov-report=term-missing
