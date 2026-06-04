@@ -24,4 +24,31 @@ uv run --no-sync cyclonedx-py environment "$SBOM_VENV" \
   --of JSON \
   -o "$SBOM_OUT"
 
+"$python_bin" - "$SBOM_OUT" <<'PY'
+import hashlib
+import json
+import sys
+import uuid
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    bom = json.load(f)
+
+bom.pop("serialNumber", None)
+canonical = json.dumps(
+    bom,
+    ensure_ascii=False,
+    separators=(",", ":"),
+    sort_keys=True,
+).encode()
+digest = hashlib.sha256(canonical).hexdigest()
+bom["serialNumber"] = "urn:uuid:" + str(
+    uuid.uuid5(uuid.NAMESPACE_URL, f"https://github.com/greycr0w/chute/sbom/{digest}")
+)
+
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(bom, f, ensure_ascii=False, indent=2, sort_keys=True)
+    f.write("\n")
+PY
+
 printf 'wrote %s\n' "$SBOM_OUT"

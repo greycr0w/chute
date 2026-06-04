@@ -387,6 +387,8 @@ def test_release_workflow_uses_pinned_actions_and_sbom_attestations() -> None:
     assert "--pyproject pyproject.toml" in script
     assert "--mc-type library" in script
     assert "--output-reproducible" in script
+    assert 'bom.pop("serialNumber", None)' in script
+    assert 'bom["serialNumber"] = "urn:uuid:"' in script
 
     assert "chute-runtime-sbom.cdx.json" in security
     assert "--predicate-type https://cyclonedx.org/bom" in security
