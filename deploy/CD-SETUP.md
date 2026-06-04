@@ -54,7 +54,7 @@ useradd --system --create-home --shell /bin/sh chute-deploy
 
 # 3. Let it pull the source, and let the shared chute group update the venv.
 chown -R chute-deploy:chute-deploy /opt/chute/src
-install -d -m 700 -o chute-deploy -g chute-deploy \
+install -d -m 2775 -o chute-deploy -g chute \
   /opt/chute/uv /opt/chute/uv/cache /opt/chute/uv/python
 usermod -aG chute chute-deploy
 chgrp -R chute /opt/chute/.venv
@@ -189,7 +189,7 @@ ssh root@your-vps '
   chmod 755 /home/chute-deploy
   chmod 755 /home/chute-deploy/.ssh
   chmod 644 /home/chute-deploy/.ssh/authorized_keys
-  install -d -m 700 -o chute-deploy -g chute-deploy /opt/chute/uv /opt/chute/uv/cache /opt/chute/uv/python
+  install -d -m 2775 -o chute-deploy -g chute /opt/chute/uv /opt/chute/uv/cache /opt/chute/uv/python
 '
 ```
 

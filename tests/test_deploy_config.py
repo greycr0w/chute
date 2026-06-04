@@ -286,8 +286,10 @@ def test_deploy_installs_stable_forced_command_runner() -> None:
         "/usr/local/sbin/chute-deploy-pull"
     ) in script
     assert "chown -R chute-deploy:chute-deploy /opt/chute/src" in script
-    assert "install -d -m 700 -o chute-deploy -g chute-deploy \\" in script
+    assert "install -d -m 2775 -o chute-deploy -g chute \\" in script
     assert "/opt/chute/uv /opt/chute/uv/cache /opt/chute/uv/python" in script
+    assert "chown -R chute-deploy:chute /opt/chute/uv" in script
+    assert "chmod -R g+rwX /opt/chute/uv" in script
     assert "useradd --system --create-home --shell /bin/sh chute-deploy" in cd_setup
     assert "install -d -m 700 -o chute-deploy -g chute-deploy /home/chute-deploy/.ssh" in cd_setup
     assert cd_setup.index("install -d -m 700") < cd_setup.index("ssh-keygen -t ed25519")
@@ -481,6 +483,13 @@ def test_python_and_uv_toolchain_are_pinned_for_ci_and_deploy() -> None:
 
     assert "PYTHON_VERSION=\"$(tr -d '[:space:]' </opt/chute/src/.python-version)\"" in deploy
     assert "command -v uv >/dev/null 2>&1 || {" in deploy
+    assert "UV_STATE_ROOT=/opt/chute/uv" in deploy
+    assert 'export UV_CACHE_DIR="$UV_STATE_ROOT/cache"' in deploy
+    assert 'export UV_PYTHON_INSTALL_DIR="$UV_STATE_ROOT/python"' in deploy
+    assert (
+        'install -d -m 2775 -o root -g chute "$UV_STATE_ROOT" "$UV_CACHE_DIR" '
+        '"$UV_PYTHON_INSTALL_DIR"'
+    ) in deploy
     assert 'uv python install "$PYTHON_VERSION"' in deploy
     assert 'uv venv --clear --seed --python "$PYTHON_VERSION" /opt/chute/.venv' in deploy
     assert "python3 -m venv" not in deploy
@@ -490,6 +499,9 @@ def test_python_and_uv_toolchain_are_pinned_for_ci_and_deploy() -> None:
     assert 'export UV_CACHE_DIR="${UV_CACHE_DIR:-$UV_STATE_ROOT/cache}"' in pull
     assert 'export UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-$UV_STATE_ROOT/python}"' in pull
     assert 'mkdir -p "$UV_CACHE_DIR" "$UV_PYTHON_INSTALL_DIR"' in pull
+    assert 'chgrp -R chute "$UV_STATE_ROOT" 2>/dev/null || true' in pull
+    assert 'chmod -R g+rwX "$UV_STATE_ROOT"' in pull
+    assert 'find "$UV_STATE_ROOT" -type d -exec chmod g+s {} +' in pull
     assert 'python_version="$(tr -d \'[:space:]\' <"$REPO/.python-version")"' in pull
     assert 'command -v uv >/dev/null 2>&1 || die "uv is required' in pull
     assert 'uv python install "$python_version"' in pull
@@ -500,7 +512,7 @@ def test_python_and_uv_toolchain_are_pinned_for_ci_and_deploy() -> None:
     assert "same default Python minor pinned in `.python-version`" in readme
     assert "The VPS must have `uv` on `PATH`" in cd_setup
     assert "recreates `/opt/chute/.venv` with that pinned Python minor" in cd_setup
-    assert "install -d -m 700 -o chute-deploy -g chute-deploy \\" in cd_setup
+    assert "install -d -m 2775 -o chute-deploy -g chute \\" in cd_setup
     assert "/opt/chute/uv /opt/chute/uv/cache /opt/chute/uv/python" in cd_setup
 
 

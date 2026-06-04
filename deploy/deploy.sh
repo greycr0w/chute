@@ -79,6 +79,10 @@ command -v uv >/dev/null 2>&1 || {
   echo "install uv once, then rerun deploy/deploy.sh" >&2
   exit 1
 }
+UV_STATE_ROOT=/opt/chute/uv
+export UV_CACHE_DIR="$UV_STATE_ROOT/cache"
+export UV_PYTHON_INSTALL_DIR="$UV_STATE_ROOT/python"
+install -d -m 2775 -o root -g chute "$UV_STATE_ROOT" "$UV_CACHE_DIR" "$UV_PYTHON_INSTALL_DIR"
 uv python install "$PYTHON_VERSION"
 uv venv --clear --seed --python "$PYTHON_VERSION" /opt/chute/.venv
 # chute itself is then installed without dependency resolution or build isolation.
@@ -128,8 +132,11 @@ chown chute:chute /etc/chute/chute.env.new
 chown -R chute:chute /opt/chute /etc/chute
 if id -u chute-deploy >/dev/null 2>&1; then
   chown -R chute-deploy:chute-deploy /opt/chute/src
-  install -d -m 700 -o chute-deploy -g chute-deploy \
+  install -d -m 2775 -o chute-deploy -g chute \
     /opt/chute/uv /opt/chute/uv/cache /opt/chute/uv/python
+  chown -R chute-deploy:chute /opt/chute/uv
+  chmod -R g+rwX /opt/chute/uv
+  find /opt/chute/uv -type d -exec chmod g+s {} +
 fi
 chgrp -R chute /opt/chute/.venv
 chmod -R g+rwX /opt/chute/.venv

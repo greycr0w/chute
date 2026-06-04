@@ -195,6 +195,9 @@ ensure_pinned_venv() {
   [ -n "$python_version" ] || die "missing $REPO/.python-version"
   command -v uv >/dev/null 2>&1 || die "uv is required to provision pinned Python $python_version"
   mkdir -p "$UV_CACHE_DIR" "$UV_PYTHON_INSTALL_DIR"
+  chgrp -R chute "$UV_STATE_ROOT" 2>/dev/null || true
+  chmod -R g+rwX "$UV_STATE_ROOT"
+  find "$UV_STATE_ROOT" -type d -exec chmod g+s {} +
   uv python install "$python_version"
   uv venv --clear --seed --python "$python_version" "$VENV"
 }
