@@ -130,6 +130,7 @@ EOF
 chmod 600 /etc/chute/chute.env.new
 chown chute:chute /etc/chute/chute.env.new
 chown -R chute:chute /opt/chute /etc/chute
+chmod g+rwx /opt/chute
 if id -u chute-deploy >/dev/null 2>&1; then
   chown -R chute-deploy:chute-deploy /opt/chute/src
   install -d -m 2775 -o chute-deploy -g chute \

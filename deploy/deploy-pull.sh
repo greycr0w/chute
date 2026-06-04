@@ -203,17 +203,17 @@ ensure_pinned_venv() {
 }
 
 install_and_restart() {
-  ensure_pinned_venv
+  ensure_pinned_venv || return
 
   # Hash-pinned runtime/build deps, then chute itself without dependency resolution.
-  "$VENV/bin/pip" install --quiet --require-hashes -r "$REPO/deploy/requirements.txt"
-  "$VENV/bin/pip" install --quiet --require-hashes -r "$REPO/deploy/build-requirements.txt"
-  "$VENV/bin/pip" install --quiet --no-build-isolation --no-deps "$REPO"
+  "$VENV/bin/pip" install --quiet --require-hashes -r "$REPO/deploy/requirements.txt" || return
+  "$VENV/bin/pip" install --quiet --require-hashes -r "$REPO/deploy/build-requirements.txt" || return
+  "$VENV/bin/pip" install --quiet --no-build-isolation --no-deps "$REPO" || return
 
-  sudo /usr/sbin/nginx -t
-  sudo /usr/bin/systemctl restart chuted
-  /usr/bin/systemctl is-active --quiet chuted
-  sudo /usr/bin/systemctl reload nginx
+  sudo /usr/sbin/nginx -t || return
+  sudo /usr/bin/systemctl restart chuted || return
+  /usr/bin/systemctl is-active --quiet chuted || return
+  sudo /usr/bin/systemctl reload nginx || return
 }
 
 deploy_commit() {

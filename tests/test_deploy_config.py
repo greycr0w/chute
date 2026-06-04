@@ -490,6 +490,7 @@ def test_python_and_uv_toolchain_are_pinned_for_ci_and_deploy() -> None:
         'install -d -m 2775 -o root -g chute "$UV_STATE_ROOT" "$UV_CACHE_DIR" '
         '"$UV_PYTHON_INSTALL_DIR"'
     ) in deploy
+    assert "chmod g+rwx /opt/chute" in deploy
     assert 'uv python install "$PYTHON_VERSION"' in deploy
     assert 'uv venv --clear --seed --python "$PYTHON_VERSION" /opt/chute/.venv' in deploy
     assert "python3 -m venv" not in deploy
@@ -514,6 +515,29 @@ def test_python_and_uv_toolchain_are_pinned_for_ci_and_deploy() -> None:
     assert "recreates `/opt/chute/.venv` with that pinned Python minor" in cd_setup
     assert "install -d -m 2775 -o chute-deploy -g chute \\" in cd_setup
     assert "/opt/chute/uv /opt/chute/uv/cache /opt/chute/uv/python" in cd_setup
+
+
+def test_deploy_pull_install_path_is_fail_fast_inside_if_condition() -> None:
+    script = (ROOT / "deploy" / "deploy-pull.sh").read_text()
+    body = script.split("install_and_restart() {", 1)[1].split("\n}", 1)[0]
+
+    assert "ensure_pinned_venv || return" in body
+    assert (
+        '"$VENV/bin/pip" install --quiet --require-hashes '
+        '-r "$REPO/deploy/requirements.txt" || return'
+    ) in body
+    assert (
+        '"$VENV/bin/pip" install --quiet --require-hashes '
+        '-r "$REPO/deploy/build-requirements.txt" || return'
+    ) in body
+    assert (
+        '"$VENV/bin/pip" install --quiet --no-build-isolation --no-deps "$REPO" || return' in body
+    )
+    assert "sudo /usr/sbin/nginx -t || return" in body
+    assert "sudo /usr/bin/systemctl restart chuted || return" in body
+    assert "/usr/bin/systemctl is-active --quiet chuted || return" in body
+    assert "sudo /usr/bin/systemctl reload nginx || return" in body
+    assert "chute deployed @" in script
 
 
 def test_deploy_pull_supports_forced_command_rollback() -> None:
