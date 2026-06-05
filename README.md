@@ -1,8 +1,18 @@
 # chute
 
-A tiny, self-hosted, zero-maintenance HTTP(S) tunnel — your own ngrok, with no
-third parties. Your VPS gets a stable public URL; traffic is relayed over a
-single authenticated, TLS-pinned connection to a local app on your Mac.
+[![CI](https://github.com/greycr0w/chute/actions/workflows/ci.yml/badge.svg)](https://github.com/greycr0w/chute/actions/workflows/ci.yml)
+[![Fuzz](https://github.com/greycr0w/chute/actions/workflows/fuzz.yml/badge.svg)](https://github.com/greycr0w/chute/actions/workflows/fuzz.yml)
+[![Release](https://github.com/greycr0w/chute/actions/workflows/release.yml/badge.svg)](https://github.com/greycr0w/chute/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+**Self-hosted HTTP(S) tunnels for local apps, demos, webhooks, and private
+tooling.** Run the public relay on your own VPS; the agent on your laptop dials
+out over one authenticated, TLS-pinned connection. No hosted relay, no third
+party traffic path, no inbound ports on your Mac.
+
+chute is the small core: one Python package, one server CLI (`chuted`), one agent
+CLI (`chute`), and an SDK (`from chute import Tunnel`). It is not a SaaS control
+plane; accounts, billing, OAuth, and dashboards belong outside the core.
 
 ```
 visitor ──▶ chute server (VPS, public)
@@ -10,6 +20,42 @@ visitor ──▶ chute server (VPS, public)
                  ▼
             chute agent (your Mac)  ──▶  127.0.0.1:8000  (your app)
 ```
+
+## Start here
+
+| If you want to... | Read this |
+| ----------------- | --------- |
+| run your first local tunnel | [Install](#install), then [Quick start](#quick-start) |
+| keep the server running on a VPS | [Deploy fire-and-forget](#deploy-fire-and-forget) |
+| embed chute in Python code | [Use as an SDK](#use-as-an-sdk) |
+| run many host-routed tunnels | [Host-routed labels](#host-routed-labels) and [Security model](#security-model) |
+| understand the transport | [Protocol](#protocol) and [docs/PROTOCOL.md](docs/PROTOCOL.md) |
+| plug in account policy or audit events | [Open-core extension boundary](#open-core-extension-boundary) |
+
+## What you get
+
+- **Public HTTP or HTTPS URLs** for local services, selected per tunnel.
+- **Outbound-only agents** that work through NAT, Wi-Fi changes, and restarts.
+- **Transparent HTTP relay** after admission: keep-alive, chunked bodies, SSE,
+  and WebSocket upgrades pass through without rewriting.
+- **Host-routed labels** for many tunnels behind one base domain, with the
+  bundled nginx config enforcing the required one-request-per-connection edge.
+- **Pinned control-channel TLS** separate from browser-facing public TLS.
+- **Typed Python SDK and CLI** in the same package, with strict typing and
+  loopback tests in CI.
+- **Self-hosted operations path**: systemd unit, nginx vhost, hash-pinned
+  deploy installs, signed forced-command CD, release attestations, and smoke
+  tests.
+
+## What chute is not
+
+- Not a hosted service. You own the VPS and the network path.
+- Not a WAF or request-inspection proxy. Your local app is still public while
+  the tunnel is open.
+- Not an ACME client. Browser-trusted public certs are owned by your external
+  ACME/nginx setup; chute owns the pinned control channel.
+- Not a database-backed cloud control plane. Core exposes seams for policy and
+  events, but standalone chute still works with one shared token.
 
 ## Why this design
 
