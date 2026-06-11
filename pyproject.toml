@@ -38,7 +38,7 @@ dependencies = [
     # cryptography 42.0.0 through 44.0.0 wheels bundle vulnerable OpenSSL
     # (GHSA-79v4-65xg-pq4g / CVE-2024-12797); keep the runtime floor at the
     # first patched release even though the lock currently resolves newer.
-    "cryptography>=44.0.1,<49",
+    "cryptography>=48.0.1,<49",
 ]
 
 [project.urls]
