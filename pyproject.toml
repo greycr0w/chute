@@ -55,7 +55,7 @@ dev = [
     "build>=1.0",
     "hypothesis>=6.0",
     "cyclonedx-bom==7.3.0",
-    "pip-audit==2.10.0",
+    "pip-audit==2.10.1",
     "pre-commit==4.6.0",
     "ruff==0.15.15",
 ]
